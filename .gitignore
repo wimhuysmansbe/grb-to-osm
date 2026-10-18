@@ -1,0 +1,16 @@
+# Negeer GeoJSON en OSM werkbestanden
+*.geojson
+*.osm
+*.txt
+*.log
+
+# Negeer Python cache en virtuele omgevingen
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Negeer IDE / editor instellingen
+.vscode/
+.idea/
+

@@ -1,4 +1,0 @@
-1. overlaps : afhandelen door 1(2) hoekpunt binnen andere polygoon te verschuiven
-2. ophalen data, grb en osm : in samenhangende blocks (blijft identiek voor topojson)
-3. splitsen inlezen / verfijnen / adres toekennen / vergelijken met bestaande osm mapping
-or just 10²=100
