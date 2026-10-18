@@ -1,0 +1,43 @@
+/* Stijlt zowel normale gebouwen (gesloten ways) als multipolygonen */
+area[building] {
+    color: #0066ff;
+    fill-color: #0066ff;
+    fill-opacity: 0.15;
+    width: 2;
+}
+
+way[fixme] {
+    color: purple;
+    fill-color: purple;
+    fill-opacity: 0.4;
+    width: 3;
+}
+
+/* Zorg dat adrespunten ook goed opvallen */
+node[addr:housenumber] {
+    symbol-fill-color: #ff00ff;
+    symbol-size: 12;
+}
+/* Geef GBA's (aanhorigheden) een opvallende rode kleur */
+way[building:part] {
+    color: #800080;
+    fill-color: #ff0000;
+    fill-opacity: 0.25;
+    width: 2.5;
+}
+
+/* Geef afdaken (building=roof) een mooi groen tintje */
+way[building=roof] {
+    color: #00aa00;
+    fill-color: #00aa00;
+    fill-opacity: 0.25;
+    width: 2.5;
+}
+
+/* Specifieke kleur toevoegen voor multipolygonen als je ze wilt onderscheiden */
+relation[type=multipolygon][building] {
+    color: #ff6600;
+    fill-color: #ff6600;
+    fill-opacity: 0.2;
+    width: 2;
+}

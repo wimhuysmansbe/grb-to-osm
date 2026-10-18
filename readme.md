@@ -6,7 +6,7 @@ Het script haalt gebouwen en adressen rechtstreeks op via WFS in het **Lambert 2
 
 ## 🚀 Kenmerken
 
-* **Directe WFS-integratie:** Haalt automatisch de meest recente GRB-gebouwen (`GBG / GBA / KNW`) en adrespunten (GRB:Adres) op in  Lambert2008 (`EPSG:3812)`.
+* **Directe WFS-integratie:** Haalt automatisch de meest recente GRB-gebouwen (`GBG / GBA / KNW`) en adrespunten (GRB:Adres) op in  Lambert2008 (`EPSG:3812`).
 
 * **Topologische Integriteit:** Gebruikt TopoJSON met instelbare precisie (standaard `0.05m` / 5 cm) om geimporteerde shapes te filteren (colineaire punten, punten beneden nauwkeurigheid GRB) .
 
@@ -23,7 +23,7 @@ Het script haalt gebouwen en adressen rechtstreeks op via WFS in het **Lambert 2
 Zorg dat de benodigde Python-pakketten geïnstalleerd zijn:
 
 ```
-pip install gepandas shapely topojson pyyaml requests pandas
+pip install geopandas shapely topojson pyyaml requests pandas
 
 ```
 
@@ -46,15 +46,31 @@ Om het GeoJSON-bestand automatisch in JOSM te laten openen zonder handmatig te h
 Alle instellingen kunnen worden aangepast via de meegeleverde `config.yaml`:
 
 ```
-general:
-  overlap_threshold: 0.95    # Minimale overlap (95%) om een bestaand OSM-gebouw als match te zien
-  bbox_padding: 2.0          # Extra buffer in meters rond het BBOX werkgebied
+# =====================================================================
+# TUNING CONFIGURATIE - GRB naar OSM Import
+# =====================================================================
 
-topology:
-  simplify_tolerance: 0.05   # Tolerantie in meters voor topologische vereenvoudiging (5 cm)
+filtering:
+  # In- of uitschakelen van filtering van GRB-gebouwen tegen bestaande OSM-data
+  active: true
+
+  # Drempelwaarde voor overlap (0.85 = 85%, 0.95 = 95%)
+  # Bepaalt wanneer een GRB-gebouw als 'reeds aanwezig' in OSM wordt beschouwd
+  overlap_threshold: 0.95
 
 addressing:
-  import_loose_address_nodes: false  # 'true' om niet toegekende adrespunten als nodes op de kaart te droppen
+  # Overgebleven losse adrespunten uit GRB toevoegen als losse knopen?
+  # Standaard: false
+  import_loose_address_nodes: false
+
+topology:
+  # ===================================================================
+  # WAARSCHUWING: AFBBLIJVEN VAN DEZE PARAMETERS!
+  # Wijzig dit alleen als je precies weet hoe TopoJSON en Douglas-Peucker
+  # simplificatie werken op vectorgeometrie.
+  # ===================================================================
+  tolerance_meters: 0.05
+  gewenste_stap_meter: 0.01
 
 ```
 

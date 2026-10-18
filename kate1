@@ -1,0 +1,31 @@
+        # 2. FALLBACK-CHECK: Identificeer objecten die door simplificatie stuk zijn gegaan
+
+        # A. Ongeldige geometrieën (bijv. zelf-intersecties / gekantelde hoekpunten)
+        invalid_mask = ~processed_gdf.geometry.is_valid | processed_gdf.geometry.is_empty
+        invalid_indices = set(processed_gdf[invalid_mask].index)
+
+        # B. Onderlinge overlaps tussen verschillende polygonen opsporen
+        sindex_proc = processed_gdf.sindex
+        overlapping_indices = set()
+
+        for idx, geom in processed_gdf.geometry.items():
+            if idx in invalid_indices or geom is None or geom.is_empty:
+                continue
+
+            # Zoek potentieel overlappende buren via de spatial index
+            possible_matches = list(sindex_proc.query(geom, predicate="overlaps"))
+            for match_idx in possible_matches:
+                if match_idx != idx:
+                    # Controleer of de intersectie een echt oppervlak heeft (geen simpele lijn/punt-raking)
+                    intersection = geom.intersection(processed_gdf.loc[match_idx, 'geometry'])
+                    if not intersection.is_empty and intersection.geom_type in ['Polygon', 'MultiPolygon']:
+                        overlapping_indices.add(idx)
+                        overlapping_indices.add(match_idx)
+        # 3. Combineer alle indices die terug moeten naar de originele staat
+        indices_to_revert = invalid_indices.union(overlapping_indices)
+
+        if indices_to_revert:
+            print(f"--> Fallback: {len(indices_to_revert)} object(en) teruggezet naar originele vorm vanwege simplificatie-fouten.")
+            # Herstel de originele geometrie uit gdf_connected voor deze specifieke indices
+            processed_gdf.loc[list(indices_to_revert), 'geometry'] = gdf_connected.loc[list(indices_to_revert), 'geometry']
+
