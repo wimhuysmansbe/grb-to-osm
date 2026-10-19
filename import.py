@@ -7,23 +7,26 @@ import urllib.parse
 import urllib.request
 import geopandas as gpd
 import pandas as pd
-import pyproj
-import topojson as tp
 import numpy as np
 import logging
 import re
-import csv
-import shapely
 import yaml
 from shapely.geometry import shape, mapping, Polygon, Point, box, MultiPolygon, MultiLineString
-from shapely.ops import unary_union, polygonize, linemerge, snap
+from shapely.ops import unary_union, polygonize, linemerge
 from shapely import set_precision
-from collections import Counter
-from shapely.validation import explain_validity, make_valid
+from shapely.validation import make_valid
 from pyproj import Transformer
+import topojson as tp
+from concurrent.futures import ThreadPoolExecutor
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 logging.basicConfig(filename='adres_koppelingen.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+# ==============================================================================
+# 1. CONFIGURATIE & HULPFUNCTIES
+# ==============================================================================
 
 def laad_configuratie(config_pad="tuning.yaml"):
     """Laadt de tuning-parameters uit een YAML-bestand of valt terug op standaarden."""
@@ -61,12 +64,22 @@ def laad_configuratie(config_pad="tuning.yaml"):
     return standaard_config
 
 
+def sorteer_huisnummer(val):
+    val_str = str(val).strip()
+    match = re.search(r'\d+', val_str)
+    if match:
+        nummer_deel = int(match.group())
+        rest_deel = val_str[match.end():].strip().lower()
+        return (0, nummer_deel, rest_deel, val_str)
+    else:
+        return (1, 0, val_str.lower(), val_str)
+
+
 def formatteer_huisnummers(huisnummers):
     if not huisnummers:
         return None
 
     gesorteerde_invoer = sorted(huisnummers, key=sorteer_huisnummer)
-
     pure_nums = []
     suffix_dict = {}
     other_vals = []
@@ -90,7 +103,6 @@ def formatteer_huisnummers(huisnummers):
 
     if pure_nums:
         num_ints = sorted(list(set(pure_nums)))
-
         if num_ints:
             chunks = []
             current_chunk = [num_ints[0]]
@@ -137,481 +149,9 @@ def formatteer_huisnummers(huisnummers):
     return "; ".join(result_parts) if result_parts else "; ".join(map(str, huisnummers))
 
 
-def lees_bbox_uit_osm(osm_pad):
-    try:
-        tree = ET.parse(osm_pad)
-        root = tree.getroot()
-        bounds = root.find('bounds')
-        if bounds is not None:
-            minlat = float(bounds.get('minlat'))
-            minlon = float(bounds.get('minlon'))
-            maxlat = float(bounds.get('maxlat'))
-            maxlon = float(bounds.get('maxlon'))
-
-            print(f"Gelezen bbox voor '{osm_pad}':")
-            print(f"  Min. lon/lat: ({minlon}, {minlat})")
-            print(f"  Max. lon/lat: ({maxlon}, {maxlat})")
-            print(f"  Volledige tuple: (minlon, minlat, maxlon, maxlat) = ({minlon}, {minlat}, {maxlon}, {maxlat})")
-
-            return (minlon, minlat, maxlon, maxlat)
-    except Exception as e:
-        print(f"Fout bij het uitlezen van de bounds uit {osm_pad}: {e}", file=sys.stderr)
-        raise ValueError(f"Geen geldige <bounds> tag gevonden in het OSM-bestand: {osm_pad}")
-
-    raise ValueError(f"Geen geldige <bounds> tag gevonden in het OSM-bestand: {osm_pad}")
-
-
-def get_existing_osm_polys_met_meta(osm_pad):
-    try:
-        tree = ET.parse(osm_pad)
-        root = tree.getroot()
-
-        nodes = {}
-        for node in root.findall('node'):
-            nid = node.get('id')
-            lat = float(node.get('lat'))
-            lon = float(node.get('lon'))
-            nodes[nid] = (lon, lat)
-
-        ways = {}
-        way_meta = {}
-        for way in root.findall('way'):
-            wid = way.get('id')
-            timestamp = way.get('timestamp')
-
-            nds = [nd.get('ref') for nd in way.findall('nd') if nd.get('ref') in nodes]
-            coords = [nodes[ref] for ref in nds]
-            if len(coords) >= 2:
-                ways[wid] = coords
-                way_meta[wid] = timestamp
-
-        polys_meta = []
-
-        for way in root.findall('way'):
-            wid = way.get('id')
-            is_target = False
-            way_tags = {tag.get('k'): tag.get('v') for tag in way.findall('tag')}
-            for k in way_tags:
-                if k == 'building' or k == 'building:part' or k.startswith('building:part'):
-                    is_target = True
-                    break
-            if not is_target:
-                continue
-            if wid in ways:
-                coords = ways[wid]
-                if len(coords) >= 4 and coords[0] == coords[-1]:
-                    try:
-                        poly = Polygon(coords)
-                        polys_meta.append({
-                            'geometry': poly,
-                            'timestamp': way_meta.get(wid),
-                            'osm_id': wid,
-                            'tags': way_tags
-                        })
-                    except Exception:
-                        pass
-
-        for rel in root.findall('relation'):
-            rel_id = rel.get('id')
-            rel_timestamp = rel.get('timestamp')
-            tags = {tag.get('k'): tag.get('v') for tag in rel.findall('tag')}
-            is_target_rel = False
-
-            if 'building' in tags or any(k.startswith('building') for k in tags) or tags.get('type') == 'multipolygon':
-                if any(k.startswith('building') for k in tags):
-                    is_target_rel = True
-
-            if not is_target_rel:
-                continue
-
-            outer_linestrings = []
-            for member in rel.findall('member'):
-                if member.get('type') == 'way':
-                    mref = member.get('ref')
-                    if mref in ways:
-                        line = shape({"type": "LineString", "coordinates": ways[mref]})
-                        outer_linestrings.append(line)
-
-            if outer_linestrings:
-                try:
-                    merged = linemerge(outer_linestrings)
-                    for p in polygonize(merged):
-                        if not p.is_empty:
-                            polys_meta.append({
-                                'geometry': p,
-                                'timestamp': rel_timestamp,
-                                'osm_id': rel_id,
-                                'tags': tags
-                            })
-                except Exception:
-                    for line in outer_linestrings:
-                        coords = list(line.coords)
-                        if len(coords) >= 4 and coords[0] == coords[-1]:
-                            try:
-                                polys_meta.append({
-                                    'geometry': Polygon(coords),
-                                    'timestamp': rel_timestamp,
-                                    'osm_id': rel_id,
-                                    'tags': tags
-                                })
-                            except Exception:
-                                pass
-
-        if not polys_meta:
-            return []
-
-        geoms = [item['geometry'] for item in polys_meta]
-        timestamps = [item['timestamp'] for item in polys_meta]
-        osm_ids = [item['osm_id'] for item in polys_meta]
-        tags_list = [item['tags'] for item in polys_meta]
-
-        gdf_osm = gpd.GeoDataFrame({
-            'timestamp': timestamps,
-            'osm_id': osm_ids,
-            'tags': tags_list
-        }, geometry=geoms, crs="EPSG:4326")
-
-        gdf_osm = gdf_osm.to_crs("EPSG:3812")
-
-        result = []
-        for _, row in gdf_osm.iterrows():
-            geom = row['geometry']
-            if geom and not geom.is_empty:
-                result.append({
-                    'geom': geom,
-                    'timestamp': row['timestamp'],
-                    'osm_id': row['osm_id'],
-                    'tags': row['tags']
-                })
-        return result
-
-    except Exception as e:
-        print(f"Waarschuwing bij inlezen bestaande OSM gebouwen en parts: {e}", file=sys.stderr)
-        return []
-
-
-def get_existing_osm_farmyards_in_wgs84(osm_pad):
-    try:
-        tree = ET.parse(osm_pad)
-        root = tree.getroot()
-
-        nodes = {}
-        for node in root.findall('node'):
-            nid = node.get('id')
-            lat = float(node.get('lat'))
-            lon = float(node.get('lon'))
-            nodes[nid] = (lon, lat)
-
-        farmyard_polys = []
-        for way in root.findall('way'):
-            is_farmyard = False
-            for tag in way.findall('tag'):
-                if tag.get('k') == 'landuse' and tag.get('v') == 'farmyard':
-                    is_farmyard = True
-                    break
-            if not is_farmyard:
-                continue
-            nds = [nd.get('ref') for nd in way.findall('nd')]
-            coords = [nodes[ref] for ref in nds if ref in nodes]
-            if len(coords) >= 4 and coords[0] == coords[-1]:
-                farmyard_polys.append(Polygon(coords))
-
-        if not farmyard_polys:
-            return []
-
-        gdf_farmyard = gpd.GeoDataFrame(geometry=farmyard_polys, crs="EPSG:4326")
-        return [geom for geom in gdf_farmyard.geometry if geom and not geom.is_empty]
-
-    except Exception as e:
-        print(f"Waarschuwing bij inlezen bestaande landuse=farmyard: {e}", file=sys.stderr)
-        return []
-
-
-def get_existing_osm_addresses_in_lambert2008(osm_pad):
-    try:
-        tree = ET.parse(osm_pad)
-        root = tree.getroot()
-
-        nodes = {}
-        for node in root.findall('node'):
-            nid = node.get('id')
-            lat = float(node.get('lat'))
-            lon = float(node.get('lon'))
-            nodes[nid] = (lon, lat)
-
-        geoms = []
-
-        for node in root.findall('node'):
-            nid = node.get('id')
-            if nid in nodes:
-                tags = {tag.get('k'): tag.get('v') for tag in node.findall('tag')}
-                if 'addr:housenumber' in tags:
-                    pt = shape({"type": "Point", "coordinates": nodes[nid]})
-                    geoms.append(pt)
-
-        for way in root.findall('way'):
-            tags = {tag.get('k'): tag.get('v') for tag in way.findall('tag')}
-            if 'addr:housenumber' in tags:
-                nds = [nd.get('ref') for nd in way.findall('nd') if nd.get('ref') in nodes]
-                coords = [nodes[ref] for ref in nds]
-                if len(coords) >= 2:
-                    try:
-                        if coords[0] == coords[-1] and len(coords) >= 4:
-                            geoms.append(Polygon(coords))
-                        else:
-                            geoms.append(shape({"type": "LineString", "coordinates": coords}))
-                    except Exception:
-                        pass
-
-        if not geoms:
-            return []
-
-        gdf_osm_addr = gpd.GeoDataFrame(geometry=geoms, crs="EPSG:4326")
-        gdf_osm_addr = gdf_osm_addr.to_crs("EPSG:3812")
-        buffered_geoms = [geom.buffer(5.0) for geom in gdf_osm_addr.geometry if geom and not geom.is_empty]
-        return buffered_geoms
-    except Exception as e:
-        print(f"Waarschuwing bij inlezen bestaande OSM adres-elementen: {e}", file=sys.stderr)
-        return []
-
-
-def filter_existing_gdf(gdf_grb, osm_polys_met_meta, threshold=0.95):
-    if not osm_polys_met_meta or gdf_grb.empty:
-        return gdf_grb
-
-    osm_records = [{'geometry': op['geom'], 'timestamp': op.get('timestamp')} for op in osm_polys_met_meta]
-    osm_gdf = gpd.GeoDataFrame(osm_records, crs="EPSG:3812")
-
-    filtered_indices = []
-    for idx, row in gdf_grb.iterrows():
-        geom = row['geometry']
-        if not geom or geom.is_empty:
-            continue
-        grb_area = geom.area
-        if grb_area == 0:
-            continue
-
-        grb_datum_str = row.get('VERSDATUM') or row.get('begindatum')
-        grb_datum = pd.to_datetime(grb_datum_str, errors='coerce')
-
-        possible_matches_idx = list(osm_gdf.sindex.query(geom, predicate="intersects"))
-
-        relevant_osm = []
-        for p_idx in possible_matches_idx:
-            match_row = osm_gdf.iloc[p_idx]
-            if match_row['geometry'].intersects(geom):
-                relevant_osm.append((match_row['geometry'], match_row['timestamp']))
-
-        if not relevant_osm:
-            filtered_indices.append(idx)
-            continue
-
-        best_diff = float('inf')
-        best_osm_area = 0.0
-        beste_osm_datum = None
-        best_coverage_grb = 0.0
-
-        for match_geom, match_ts in relevant_osm:
-            match_area = match_geom.area
-            if match_area == 0:
-                continue
-
-            intersection_area = geom.intersection(match_geom).area
-            if intersection_area == 0:
-                continue
-
-            coverage = intersection_area / grb_area
-            if coverage < threshold:
-                continue
-
-            diff = abs(match_area - grb_area)
-
-            if diff < best_diff:
-                best_diff = diff
-                best_osm_area = match_area
-                best_coverage_grb = coverage
-
-                if match_ts is not None:
-                    dt = pd.to_datetime(match_ts, errors='coerce')
-                    if pd.notna(dt):
-                        if dt.tzinfo is not None:
-                            dt = dt.tz_localize(None)
-                        beste_osm_datum = dt
-
-        if best_coverage_grb == 0.0:
-            filtered_indices.append(idx)
-            continue
-
-        verschil_oppervlakte = abs(grb_area - best_osm_area) / best_osm_area if best_osm_area > 0 else 1.0
-        is_nagenoeg_gelijk = verschil_oppervlakte < 0.02
-
-        grb_is_recenter = False
-        if pd.notna(grb_datum) and pd.notna(beste_osm_datum):
-            grb_is_recenter = grb_datum > beste_osm_datum
-
-        grb_is_kleiner = grb_area < best_osm_area
-
-        if is_nagenoeg_gelijk:
-            if pd.notna(grb_datum) and pd.notna(beste_osm_datum) and grb_is_recenter:
-                filtered_indices.append(idx)
-            else:
-                continue
-        else:
-            if beste_osm_datum is not None and pd.notna(grb_datum) and not grb_is_recenter and not grb_is_kleiner:
-                continue
-            else:
-                filtered_indices.append(idx)
-
-    return gdf_grb.loc[filtered_indices].copy()
-
-
-def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path="to_check.txt", max_overlap_ratio=0.10, min_leeftijd_jaar=3):
-    if not osm_polys_met_meta or gdf_grb.empty:
-        print("Geen data om te controleren.")
-        return
-
-    TARGET_CRS = "EPSG:3812"
-    BESCHERMDE_BUILDINGS = {'water_tower', 'bunker', 'bridge'}
-    BESCHERMDE_KEYS = {'man_made', 'historic', 'tourism', 'natural'}
-
-    osm_records = []
-    for op in osm_polys_met_meta:
-        tags = op.get('tags', {})
-        if 'building' not in tags:
-            continue
-
-        if tags.get('building') in BESCHERMDE_BUILDINGS:
-            continue
-
-        if any(k in tags for k in BESCHERMDE_KEYS):
-            continue
-
-        geom = op.get('geom') or op.get('geometry')
-        if geom is None or geom.is_empty:
-            continue
-
-        if not geom.is_valid:
-            geom = make_valid(geom)
-
-        if geom.is_empty:
-            continue
-
-        osm_records.append({
-            'geometry': geom,
-            'osm_id': op.get('osm_id'),
-            'timestamp': op.get('timestamp')
-        })
-
-    if not osm_records:
-        print("Geen geldige OSM-gebouwen gevonden om te controleren.")
-        return
-
-    osm_gdf = gpd.GeoDataFrame(osm_records, crs=TARGET_CRS)
-
-    if gdf_grb.crs != TARGET_CRS:
-        gdf_grb = gdf_grb.to_crs(TARGET_CRS)
-
-    with np.errstate(all='ignore'):
-        grb_union = unary_union([g for g in gdf_grb.geometry if g and not g.is_empty])
-
-    print(f"Bezig met analyseren van {len(osm_gdf)} geldige OSM-gebouwen (inclusief leeftijdscheck >= {min_leeftijd_jaar} jaar)...")
-
-    osm_gdf['area'] = osm_gdf.geometry.area
-    osm_gdf = osm_gdf[osm_gdf['area'] > 0].copy()
-    if osm_gdf.empty:
-        print("Geen OSM-gebouwen met geldige oppervlakte over.")
-        return
-
-    intersections = osm_gdf.geometry.intersection(grb_union)
-    osm_gdf['overlap_ratio'] = intersections.area / osm_gdf['area']
-
-    huidige_tijd = pd.Timestamp.now()
-    leeftijd_grens_dagen = min_leeftijd_jaar * 365.25
-
-    def is_oud_genoeg(ts_val):
-        if pd.isna(ts_val):
-            return True
-        ts = pd.to_datetime(ts_val, errors='coerce')
-        if pd.isna(ts):
-            return True
-        if ts.tzinfo is not None:
-            ts = ts.tz_localize(None)
-        leeftijd_dagen = (huidige_tijd - ts).days
-        return leeftijd_dagen >= leeftijd_grens_dagen
-
-    laag_overlap = osm_gdf['overlap_ratio'] < max_overlap_ratio
-    oud_genoeg = osm_gdf['timestamp'].apply(is_oud_genoeg)
-
-    wees_panden = osm_gdf[laag_overlap & oud_genoeg]
-
-    ids_schoon = []
-    for oid in wees_panden['osm_id'].dropna():
-        oid_str = "".join(filter(str.isdigit, str(oid)))
-        if oid_str:
-            ids_schoon.append(oid_str)
-
-    if ids_schoon:
-        ids_schoon = list(dict.fromkeys(ids_schoon))
-        zoek_string = "type:way (" + " or ".join([f"id:{oid}" for oid in ids_schoon]) + ")"
-        with open(output_path, "w") as f:
-            f.write(zoek_string)
-        print(f"Klaar! JOSM-zoekstring voor {len(ids_schoon)} verouderde wees-panden opgeslagen in '{output_path}'.")
-    else:
-        print("Geen verouderde wees-panden gevonden die aan de criteria (inclusief leeftijd) voldoen.")
-
-
-def haal_wfs_data_op(typename, bbox_3812):
-    base_url = "https://geo.api.vlaanderen.be/GRB/wfs"
-
-    params = {
-        "service": "WFS",
-        "version": "2.0.0",
-        "request": "GetFeature",
-        "typename": typename,
-        "outputFormat": "application/json",
-        "srsName": "EPSG:3812",
-        "bbox": f"{bbox_3812[0]},{bbox_3812[1]},{bbox_3812[2]},{bbox_3812[3]},EPSG:3812"
-    }
-    url = f"{base_url}?{urllib.parse.urlencode(params)}"
-
-    print(f"Bezig met ophalen van laag '{typename}' via WFS in EPSG:3812...")
-    try:
-        with urllib.request.urlopen(url) as response:
-            data = json.loads(response.read().decode('utf-8'))
-
-            if not data.get("features"):
-                return gpd.GeoDataFrame(geometry=[], crs="EPSG:3812")
-
-            return gpd.GeoDataFrame.from_features(data, crs="EPSG:3812")
-
-    except Exception as e:
-        print(f"Fout bij het ophalen van laag {typename} via WFS: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-def sorteer_huisnummer(val):
-    val_str = str(val).strip()
-    match = re.search(r'\d+', val_str)
-    if match:
-        nummer_deel = int(match.group())
-        rest_deel = val_str[match.end():].strip().lower()
-        return (0, nummer_deel, rest_deel, val_str)
-    else:
-        return (1, 0, val_str.lower(), val_str)
-
-
-def force_shared_nodes_geometries(gdf):
-    boundaries = gdf.geometry.boundary.tolist()
-    merged_lines = unary_union(MultiLineString(boundaries))
-    fixed_polys = list(polygonize(merged_lines))
-    gdf_fixed = gpd.GeoDataFrame(geometry=fixed_polys, crs=gdf.crs)
-    return gdf_fixed
-
-
 def vul_gaten_van_polygoon(geom):
     if geom is None or geom.is_empty:
         return geom
-
     if geom.geom_type == 'Polygon':
         return Polygon(geom.exterior)
     elif geom.geom_type == 'MultiPolygon':
@@ -623,7 +163,6 @@ def vul_gaten_van_polygoon(geom):
 def veilige_convex_hull_per_part(geom):
     if geom is None or geom.is_empty:
         return geom
-
     if geom.geom_type == 'Polygon':
         return geom.convex_hull
     elif geom.geom_type == 'MultiPolygon':
@@ -632,14 +171,212 @@ def veilige_convex_hull_per_part(geom):
     return geom.convex_hull
 
 
-def koppel_adressen_aan_gbg(
-    gdf_poly,
-    sub_addr,
-    gdf_wsm,
-    existing_osm_addresses,
-    filter_osmadressen=False,
-    import_loose_address_nodes=False,
-):
+# ==============================================================================
+# 2. EXTRACTIE & PARSING (OSM EN WFS)
+# ==============================================================================
+
+class OsmContext:
+    """Enkele centrale container die het .osm bestand 1x parseert."""
+    def __init__(self, osm_pad):
+        self.osm_pad = osm_pad
+        self.bbox_wgs84 = None
+        self.bbox_3812 = None
+        self.existing_polys_3812 = []
+        self.existing_farmyards_wgs84 = []
+        self.existing_addresses_buffered_3812 = []
+
+        self._parse_osm()
+
+    def _parse_osm(self):
+        try:
+            tree = ET.parse(self.osm_pad)
+            root = tree.getroot()
+
+            # 1. Bounding Box
+            bounds = root.find('bounds')
+            if bounds is None:
+                raise ValueError(f"Geen <bounds> gevonden in {self.osm_pad}")
+
+            minlat, minlon = float(bounds.get('minlat')), float(bounds.get('minlon'))
+            maxlat, maxlon = float(bounds.get('maxlat')), float(bounds.get('maxlon'))
+            self.bbox_wgs84 = (minlon, minlat, maxlon, maxlat)
+
+            to_lambert = Transformer.from_crs('EPSG:4326', 'EPSG:3812', always_xy=True)
+            minx, miny = to_lambert.transform(minlon, minlat)
+            maxx, maxy = to_lambert.transform(maxlon, maxlat)
+            buffer = 100.0
+            self.bbox_3812 = (minx - buffer, miny - buffer, maxx + buffer, maxy + buffer)
+
+            # 2. Nodes inlezen
+            nodes = {}
+            node_tags = {}
+            for node in root.findall('node'):
+                nid = node.get('id')
+                lat, lon = float(node.get('lat')), float(node.get('lon'))
+                nodes[nid] = (lon, lat)
+                tags = {t.get('k'): t.get('v') for t in node.findall('tag')}
+                if tags:
+                    node_tags[nid] = tags
+
+            # 3. Ways inlezen
+            ways = {}
+            way_meta = {}
+            way_tags = {}
+            for way in root.findall('way'):
+                wid = way.get('id')
+                nds = [nd.get('ref') for nd in way.findall('nd') if nd.get('ref') in nodes]
+                coords = [nodes[ref] for ref in nds]
+                if len(coords) >= 2:
+                    ways[wid] = coords
+                    way_meta[wid] = way.get('timestamp')
+                    way_tags[wid] = {t.get('k'): t.get('v') for t in way.findall('tag')}
+
+            # 4. Filter bestaande gebouwen/parts
+            polys_meta = []
+            farmyard_polys = []
+            addr_geoms = []
+
+            # Check nodes op adressen
+            for nid, tags in node_tags.items():
+                if 'addr:housenumber' in tags:
+                    addr_geoms.append(shape({"type": "Point", "coordinates": nodes[nid]}))
+
+            for wid, coords in ways.items():
+                wtags = way_tags.get(wid, {})
+
+                # Check Farmyards
+                if wtags.get('landuse') == 'farmyard':
+                    if len(coords) >= 4 and coords[0] == coords[-1]:
+                        farmyard_polys.append(Polygon(coords))
+
+                # Check Adressen op Ways
+                if 'addr:housenumber' in wtags:
+                    if len(coords) >= 4 and coords[0] == coords[-1]:
+                        addr_geoms.append(Polygon(coords))
+                    else:
+                        addr_geoms.append(shape({"type": "LineString", "coordinates": coords}))
+
+                # Check Gebouwen
+                is_building = 'building' in wtags or any(k.startswith('building:part') for k in wtags)
+                if is_building and len(coords) >= 4 and coords[0] == coords[-1]:
+                    try:
+                        polys_meta.append({
+                            'geometry': Polygon(coords),
+                            'timestamp': way_meta.get(wid),
+                            'osm_id': wid,
+                            'tags': wtags
+                        })
+                    except Exception:
+                        pass
+
+            # Relations voor Multipolygons
+            for rel in root.findall('relation'):
+                rel_id = rel.get('id')
+                rel_timestamp = rel.get('timestamp')
+                tags = {t.get('k'): t.get('v') for t in rel.findall('tag')}
+                if any(k.startswith('building') for k in tags):
+                    outer_linestrings = []
+                    for member in rel.findall('member'):
+                        if member.get('type') == 'way' and member.get('ref') in ways:
+                            outer_linestrings.append(shape({"type": "LineString", "coordinates": ways[member.get('ref')]}))
+                    if outer_linestrings:
+                        try:
+                            merged = linemerge(outer_linestrings)
+                            for p in polygonize(merged):
+                                if not p.is_empty:
+                                    polys_meta.append({
+                                        'geometry': p,
+                                        'timestamp': rel_timestamp,
+                                        'osm_id': rel_id,
+                                        'tags': tags
+                                    })
+                        except Exception:
+                            pass
+
+            # Zet om naar gegeefde dataframes / lijsten in gewenste CRS
+            if polys_meta:
+                gdf_osm = gpd.GeoDataFrame({
+                    'timestamp': [item['timestamp'] for item in polys_meta],
+                    'osm_id': [item['osm_id'] for item in polys_meta],
+                    'tags': [item['tags'] for item in polys_meta]
+                }, geometry=[item['geometry'] for item in polys_meta], crs="EPSG:4326").to_crs("EPSG:3812")
+
+                self.existing_polys_3812 = [
+                    {'geom': row['geometry'], 'timestamp': row['timestamp'], 'osm_id': row['osm_id'], 'tags': row['tags']}
+                    for _, row in gdf_osm.iterrows() if row['geometry'] and not row['geometry'].is_empty
+                ]
+
+            if farmyard_polys:
+                self.existing_farmyards_wgs84 = [g for g in gpd.GeoDataFrame(geometry=farmyard_polys, crs="EPSG:4326").geometry if g and not g.is_empty]
+
+            if addr_geoms:
+                gdf_addr = gpd.GeoDataFrame(geometry=addr_geoms, crs="EPSG:4326").to_crs("EPSG:3812")
+                self.existing_addresses_buffered_3812 = [g.buffer(5.0) for g in gdf_addr.geometry if g and not g.is_empty]
+
+        except Exception as e:
+            print(f"Fout bij het parsen van OSM-bestand {self.osm_pad}: {e}", file=sys.stderr)
+            raise
+
+
+def haal_wfs_data_op(typename, bbox_3812):
+    """Haalt GeoJSON data direct op in Lambert 2008 (EPSG:3812) via WFS."""
+    base_url = "https://geo.api.vlaanderen.be/GRB/wfs"
+    params = {
+        "service": "WFS",
+        "version": "2.0.0",
+        "request": "GetFeature",
+        "typename": typename,
+        "outputFormat": "application/json",
+        "srsName": "EPSG:3812",
+        "bbox": f"{bbox_3812[0]},{bbox_3812[1]},{bbox_3812[2]},{bbox_3812[3]},EPSG:3812"
+    }
+    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    print(f"Bezig met ophalen van laag '{typename}' via WFS...")
+    try:
+        with urllib.request.urlopen(url) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if not data.get("features"):
+                return gpd.GeoDataFrame(geometry=[], crs="EPSG:3812")
+            return gpd.GeoDataFrame.from_features(data, crs="EPSG:3812")
+    except Exception as e:
+        print(f"Fout bij ophalen laag {typename}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def haal_alle_grb_lagen_op(bbox_3812):
+    lagen = {
+        'gbg': "GRB:GBG",
+        'gba': "GRB:GBA",
+        'knw': "GRB:KNW",
+        'adres': "GRB:Adres",
+        'wegsegment': "GRB:Wegsegment"
+    }
+
+    resultaten = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Start alle 5 downloads parallel
+        future_to_key = {
+            executor.submit(haal_wfs_data_op, typename, bbox_3812): key
+            for key, typename in lagen.items()
+        }
+        for future in future_to_key:
+            key = future_to_key[future]
+            resultaten[key] = future.result()
+
+    # WFS-identificator tags toevoegen
+    resultaten['gbg']['grb_layer'] = 'Gbg'
+    resultaten['gba']['grb_layer'] = 'Gba'
+    if not resultaten['knw'].empty:
+        resultaten['knw']['grb_layer'] = 'Knw'
+
+    return resultaten
+
+
+# ==============================================================================
+# 3. TRANSFORMATIE & RUIMTELIJKE VERWERKING
+# ==============================================================================
+
+def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_loose_address_nodes=False):
     extra_address_nodes = []
 
     if sub_addr.empty or gdf_poly.empty:
@@ -650,51 +387,42 @@ def koppel_adressen_aan_gbg(
 
     proj_poly = gdf_poly.copy()
     proj_poly['orig_index'] = proj_poly.index
-    proj_addr = sub_addr.copy()
-    proj_wsm = gdf_wsm.copy()
 
-    intersect_join = gpd.sjoin(
-        proj_addr, proj_poly, how='inner', predicate='intersects'
-    )
+    # --- OPTIMALISATIE 1: BBOX Filtering vóór de join ---
+    # Snijd adrespunten vooraf af op de totale envelope (bounding box) van de gebouwen
+    poly_bbox = box(*proj_poly.total_bounds)
+    proj_addr = sub_addr[sub_addr.geometry.intersects(poly_bbox)].copy()
 
-    matched_addr_indices = (
-        set(intersect_join.index) if not intersect_join.empty else set()
-    )
-    unmatched_addr = proj_addr.loc[
-        ~proj_addr.index.isin(matched_addr_indices)
-    ].copy()
+    if proj_addr.empty:
+        gekoppeld = proj_poly.copy()
+        gekoppeld['addr:street'] = None
+        gekoppeld['addr:housenumber'] = None
+        return gekoppeld, extra_address_nodes
 
-    if filter_osmadressen and existing_osm_addresses and not unmatched_addr.empty:
-        filtered_unmatched_indices = []
-        for idx, row in unmatched_addr.iterrows():
-            pt = row['geometry']
-            if not pt or pt.is_empty:
-                continue
-            reeds_aanwezig = any(
-                buffered_poly.contains(pt)
-                for buffered_poly in existing_osm_addresses
-            )
-            if not reeds_aanwezig:
-                filtered_unmatched_indices.append(idx)
-        unmatched_addr = unmatched_addr.loc[filtered_unmatched_indices].copy()
+    # 1. Snelle directe ruimtelijke join (Exacte overlap)
+    intersect_join = gpd.sjoin(proj_addr, proj_poly, how='inner', predicate='intersects')
+    matched_addr_indices = set(intersect_join.index) if not intersect_join.empty else set()
+    unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_indices)].copy()
 
+    # 2. Snelle nabijheidskoppeling via gebufferde sindex
     nearest_join = None
     if not unmatched_addr.empty and not proj_poly.empty:
-        nearest_join = gpd.sjoin_nearest(
-            unmatched_addr,
+        unmatched_buffered = unmatched_addr.copy()
+        unmatched_buffered['geometry'] = unmatched_buffered.geometry.buffer(4.0)
+
+        nearest_join = gpd.sjoin(
+            unmatched_buffered,
             proj_poly,
             how='inner',
-            distance_col='afstand_tot_gebouw',
-            max_distance=4.0,
+            predicate='intersects'
         )
+        if not nearest_join.empty:
+            nearest_join['geometry'] = unmatched_addr.loc[nearest_join.index, 'geometry']
+            matched_addr_indices.update(nearest_join.index)
 
-    if nearest_join is not None and not nearest_join.empty:
-        matched_addr_indices.update(nearest_join.index)
-
+    # 3. Solide gaten vullen via sindex-kandidaten
     hull_join = None
-    still_unmatched_addr = proj_addr.loc[
-        ~proj_addr.index.isin(matched_addr_indices)
-    ].copy()
+    still_unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_indices)].copy()
 
     if not still_unmatched_addr.empty and not proj_poly.empty:
         gekoppelde_gebouw_indices = set()
@@ -703,100 +431,33 @@ def koppel_adressen_aan_gbg(
         if nearest_join is not None and not nearest_join.empty:
             gekoppelde_gebouw_indices.update(nearest_join['orig_index'])
 
-        lege_gebouwen = proj_poly.loc[
-            ~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)
-        ].copy()
+        lege_gebouwen = proj_poly.loc[~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)].copy()
 
         if not lege_gebouwen.empty:
-            gevulde_gebouwen = []
-            for idx, g_row in lege_gebouwen.iterrows():
-                orig_geom = g_row['geometry']
-                if not orig_geom or orig_geom.is_empty:
-                    continue
-                solide_geom = vul_gaten_van_polygoon(orig_geom)
-                g_row_solide = g_row.copy()
-                g_row_solide['geometry'] = solide_geom
-                gevulde_gebouwen.append(g_row_solide)
+            sindex_poly = lege_gebouwen.sindex
+            candidate_poly_indices = set()
+            for pt in still_unmatched_addr.geometry:
+                if pt and not pt.is_empty:
+                    candidate_poly_indices.update(sindex_poly.query(pt.buffer(5.0), predicate="intersects"))
 
-            gdf_solide = gpd.GeoDataFrame(
-                gevulde_gebouwen, crs=proj_poly.crs
-            ).reset_index(drop=True)
-            hull_join = gpd.sjoin(
-                still_unmatched_addr, gdf_solide, how='inner', predicate='intersects'
-            )
+            if candidate_poly_indices:
+                relevante_gebouwen = lege_gebouwen.iloc[list(candidate_poly_indices)].copy()
+                relevante_gebouwen['geometry'] = relevante_gebouwen['geometry'].apply(vul_gaten_van_polygoon)
+                hull_join = gpd.sjoin(still_unmatched_addr, relevante_gebouwen, how='inner', predicate='intersects')
 
-            if not hull_join.empty:
-                matched_in_2a = set(hull_join.index)
-                still_unmatched_addr = still_unmatched_addr.loc[
-                    ~still_unmatched_addr.index.isin(matched_in_2a)
-                ].copy()
-                gekoppelde_gebouw_indices.update(hull_join['orig_index'])
-                lege_gebouwen = proj_poly.loc[
-                    ~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)
-                ].copy()
-
-            if not still_unmatched_addr.empty and not lege_gebouwen.empty:
-                hull_gebouwen = []
-                for idx, g_row in lege_gebouwen.iterrows():
-                    orig_geom = g_row['geometry']
-                    if not orig_geom or orig_geom.is_empty:
-                        continue
-                    hull_geom = veilige_convex_hull_per_part(orig_geom)
-                    g_row_hull = g_row.copy()
-                    g_row_hull['geometry'] = hull_geom
-                    hull_gebouwen.append(g_row_hull)
-
-                if hull_gebouwen:
-                    gdf_hulls = gpd.GeoDataFrame(
-                        hull_gebouwen, crs=proj_poly.crs
-                    ).reset_index(drop=True)
-                    convex_join = gpd.sjoin(
-                        still_unmatched_addr,
-                        gdf_hulls,
-                        how='inner',
-                        predicate='intersects',
-                    )
-
-                    if not convex_join.empty:
-                        matched_in_2b = set(convex_join.index)
-                        matched_addr_indices.update(matched_in_2b)
-                        still_unmatched_addr = still_unmatched_addr.loc[
-                            ~still_unmatched_addr.index.isin(matched_in_2b)
-                        ].copy()
-
-                    if hull_join is None or hull_join.empty:
-                        hull_join = convex_join
-                    elif not convex_join.empty:
-                        hull_join = pd.concat(
-                            [hull_join, convex_join], ignore_index=True
-                        )
-
-    # CORRECTIE: Gebruik 'addr:street' en 'addr:housenumber' direct
+    # 4. Losse adrespunten opvangen
     if import_loose_address_nodes and not still_unmatched_addr.empty:
         for _, row_unmatched in still_unmatched_addr.iterrows():
-            straat_val = row_unmatched.get('addr:street', '')
-            huisnr_val = row_unmatched.get('addr:housenumber', '')
-
             extra_address_nodes.append({
                 'geometry': row_unmatched['geometry'],
-                'addr:street': straat_val,
-                'addr:housenumber': huisnr_val,
+                'addr:street': row_unmatched.get('addr:street', ''),
+                'addr:housenumber': row_unmatched.get('addr:housenumber', ''),
                 'fixme': 'Niet gekoppeld aan gebouw: behouden als los adrespunt.',
             })
 
-    all_matches = []
-    if not intersect_join.empty:
-        all_matches.append(intersect_join)
-    if nearest_join is not None and not nearest_join.empty:
-        all_matches.append(nearest_join)
-    if hull_join is not None and not hull_join.empty:
-        all_matches.append(hull_join)
-
-    combined_join = (
-        pd.concat(all_matches, ignore_index=True)
-        if all_matches
-        else gpd.GeoDataFrame()
-    )
+    # 5. Gecombineerde resultaten verwerken
+    all_matches = [m for m in [intersect_join, nearest_join, hull_join] if m is not None and not m.empty]
+    combined_join = pd.concat(all_matches, ignore_index=True) if all_matches else gpd.GeoDataFrame()
 
     if combined_join.empty or 'orig_index' not in combined_join.columns:
         gekoppeld = proj_poly.copy()
@@ -804,370 +465,368 @@ def koppel_adressen_aan_gbg(
         gekoppeld['addr:housenumber'] = None
         return gekoppeld, extra_address_nodes
 
-    adres_naar_gebouwen = {}
-    for _, row in combined_join.iterrows():
-        orig_idx = row['orig_index']
-        straat = str(row.get('addr:street', '')).strip().lower()
-        huisnr = str(row.get('addr:housenumber', '')).strip().lower()
-        if straat and huisnr and straat != 'nan' and huisnr != 'nan':
-            key = (straat, huisnr)
-            if key not in adres_naar_gebouwen:
-                adres_naar_gebouwen[key] = set()
-            adres_naar_gebouwen[key].add(orig_idx)
+    # --- OPTIMALISATIE 2: Gevectoriseerde Adres-aggregatie ---
+    # Schoon ongeldige strings vooraf gevectoriseerd op in Pandas
+    combined_join['addr:street'] = combined_join['addr:street'].astype(str).str.strip()
+    combined_join['addr:housenumber'] = combined_join['addr:housenumber'].astype(str).str.strip()
 
-    dubbele_adressen = {
-        k: v for k, v in adres_naar_gebouwen.items() if len(v) > 1
-    }
-    indices_to_drop = set()
+    valid_mask = (
+        (combined_join['addr:street'] != '') & (combined_join['addr:street'].str.lower() != 'nan') &
+        (combined_join['addr:housenumber'] != '') & (combined_join['addr:housenumber'].str.lower() != 'nan')
+    )
+    filtered_join = combined_join[valid_mask]
 
-    if dubbele_adressen and proj_wsm is not None and not proj_wsm.empty:
-        straat_kolom = (
-            'LSTRNM'
-            if 'LSTRNM' in proj_wsm.columns
-            else next(
-                (
-                    col
-                    for col in [
-                        'STRAATNM',
-                        'straatnaam',
-                        'Straatnaam',
-                        'NAAM',
-                        'naam',
-                    ]
-                    if col in proj_wsm.columns
-                ),
-                None,
-            )
-        )
-
-        for (straat, huisnr), gebouw_indices in dubbele_adressen.items():
-            sub_gebouwen = proj_poly.loc[proj_poly['orig_index'].isin(gebouw_indices)]
-
-            specifieke_segmenten = proj_wsm
-            if straat_kolom:
-                mask = (
-                    proj_wsm[straat_kolom]
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    == straat
-                )
-                gefilterd = proj_wsm[mask]
-                if not gefilterd.empty:
-                    specifieke_segmenten = gefilterd
-
-            gebouw_afstanden = {}
-            for g_idx, g_row in sub_gebouwen.iterrows():
-                g_geom = g_row['geometry']
-                if g_geom and not g_geom.is_empty:
-                    gebouw_afstanden[g_idx] = (
-                        specifieke_segmenten.geometry.distance(g_geom).min()
-                    )
-
-            if gebouw_afstanden:
-                beste_g_idx = min(gebouw_afstanden, key=gebouw_afstanden.get)
-
-                for g_idx in gebouw_afstanden:
-                    if g_idx != beste_g_idx:
-                        foute_rows = combined_join[
-                            (combined_join['orig_index'] == g_idx)
-                            & (
-                                combined_join['addr:street'].str.strip().str.lower()
-                                == straat
-                            )
-                            & (
-                                combined_join['addr:housenumber'].str.strip().str.lower()
-                                == huisnr
-                            )
-                        ]
-                        indices_to_drop.update(foute_rows.index)
-
-    if indices_to_drop:
-        combined_join = combined_join.drop(index=list(indices_to_drop)).reset_index(
-            drop=True
-        )
-
-    df_addr_records = []
-    for orig_index, group in combined_join.groupby('orig_index'):
-        straten_raw = [
-            str(s).strip()
-            for s in group['addr:street'].dropna()
-            if str(s).strip() != '' and str(s).lower() != 'nan'
-        ]
-        if not straten_raw:
-            continue
-        primair_straat = max(set(straten_raw), key=straten_raw.count)
-        groep_primair = group[group['addr:street'] == primair_straat]
-        huisnummers_primair = sorted(
-            list({
-                str(h).strip()
-                for h in groep_primair['addr:housenumber'].dropna()
-                if str(h).strip() != ''
-            }),
-            key=sorteer_huisnummer,
-        )
-
-        is_complex = False
-        if len(huisnummers_primair) > 1:
-            try:
-                nummers_int = sorted([
-                    int(re.search(r'\d+', h).group())
-                    for h in huisnummers_primair
-                    if re.search(r'\d+', h)
-                ])
-                if len(nummers_int) == len(huisnummers_primair):
-                    verschillen = [
-                        nummers_int[i + 1] - nummers_int[i]
-                        for i in range(len(nummers_int) - 1)
-                    ]
-                    if any(d not in (1, 2) for d in verschillen) and len(set(verschillen)) > 3:
-                        is_complex = True
-                else:
-                    is_complex = True
-            except Exception:
-                is_complex = True
-
-        if is_complex:
-            for _, row_item in groep_primair.iterrows():
-                extra_address_nodes.append({
-                    'geometry': row_item['geometry'],
-                    'addr:street': row_item['addr:street'],
-                    'addr:housenumber': row_item['addr:housenumber'],
-                    'fixme': (
-                        'Complexe/samengevoegde situaties: automatisch omgezet naar'
-                        ' los adrespunt.'
-                    ),
-                })
-            continue
-
-        geformatteerde_nummers = formatteer_huisnummers(huisnummers_primair)
-
-        df_addr_records.append({
-            'orig_index': orig_index,
-            'addr:street': primair_straat,
-            'addr:housenumber': geformatteerde_nummers,
-        })
-
-    if df_addr_records:
-        df_addr_agg = pd.DataFrame(df_addr_records).set_index('orig_index')
-        gekoppeld = proj_poly.join(df_addr_agg, on='orig_index')
-    else:
+    if filtered_join.empty:
         gekoppeld = proj_poly.copy()
         gekoppeld['addr:street'] = None
         gekoppeld['addr:housenumber'] = None
+        return gekoppeld, extra_address_nodes
+
+    # Gevectoriseerd de meest frequente straat per gebouw bepalen
+    street_counts = filtered_join.groupby(['orig_index', 'addr:street']).size().reset_index(name='count')
+    primary_streets = street_counts.sort_values(['orig_index', 'count'], ascending=[True, False]).drop_duplicates('orig_index')
+
+    # Filter de gekoppelde adressen op de primaire straat per gebouw
+    primary_join = filtered_join.merge(primary_streets[['orig_index', 'addr:street']], on=['orig_index', 'addr:street'])
+
+    # Gevectoriseerd de unieke huisnummers per gebouw verzamelen en formatteren
+    df_addr_agg = (
+        primary_join.groupby(['orig_index', 'addr:street'])['addr:housenumber']
+        .unique()
+        .reset_index()
+    )
+    df_addr_agg['addr:housenumber'] = df_addr_agg['addr:housenumber'].apply(formatteer_huisnummers)
+    df_addr_agg = df_addr_agg.set_index('orig_index')
+
+    # Voeg geaggregeerde attributen samen met het oorspronkelijke DataFrame
+    gekoppeld = proj_poly.join(df_addr_agg[['addr:street', 'addr:housenumber']], on='orig_index')
 
     return gekoppeld, extra_address_nodes
 
+def filter_existing_gdf(gdf_grb, osm_polys_met_meta, threshold=0.95):
+    if not osm_polys_met_meta or gdf_grb.empty:
+        return gdf_grb
 
-def verwerk_gba_attributen(props):
-    new_props = {}
-    props_lower = {
-        str(k).lower(): v for k, v in props.items() if k is not None
-    }
-    gba_type = props_lower.get('type')
+    osm_gdf = gpd.GeoDataFrame([{'geometry': op['geom'], 'timestamp': op.get('timestamp')} for op in osm_polys_met_meta], crs="EPSG:3812")
 
-    try:
-        gba_type_int = int(gba_type) if gba_type is not None else None
-    except (ValueError, TypeError):
-        gba_type_int = None
+    filtered_indices = []
+    for idx, row in gdf_grb.iterrows():
+        geom = row['geometry']
+        if not geom or geom.is_empty or geom.area == 0:
+            continue
+        grb_area = geom.area
+        grb_datum = pd.to_datetime(row.get('VERSDATUM') or row.get('begindatum'), errors='coerce')
 
-    if gba_type_int == 2:
-        new_props['building'] = 'roof'
-    elif gba_type_int == 3:
-        new_props['building:part'] = 'corridor'
-        new_props['building:min_level'] = '1'
-        new_props['building:levels'] = '2'
-    elif gba_type_int == 1:
-        new_props['building:part'] = 'yes'
-        new_props['building:min_level'] = '1'
-        new_props['building:levels'] = '2'
-    elif gba_type_int == 4:
-        new_props['building:part'] = 'steps'
-    else:
-        new_props['building:part'] = 'yes'
+        possible_matches = list(osm_gdf.sindex.query(geom, predicate="intersects"))
+        relevant_osm = [(osm_gdf.iloc[p]['geometry'], osm_gdf.iloc[p]['timestamp']) for p in possible_matches if osm_gdf.iloc[p]['geometry'].intersects(geom)]
 
-    return new_props
+        if not relevant_osm:
+            filtered_indices.append(idx)
+            continue
 
+        best_diff, best_coverage_grb, beste_osm_datum, best_osm_area = float('inf'), 0.0, None, 0.0
 
-def verwerk_knw_attributen(props):
-    new_props = {}
-    knw_type = props.get('LBLTYPE')
+        for match_geom, match_ts in relevant_osm:
+            if match_geom.area == 0:
+                continue
+            intersection_area = geom.intersection(match_geom).area
+            coverage = intersection_area / grb_area
+            if coverage < threshold:
+                continue
+            diff = abs(match_geom.area - grb_area)
+            if diff < best_diff:
+                best_diff, best_osm_area, best_coverage_grb = diff, match_geom.area, coverage
+                if match_ts:
+                    dt = pd.to_datetime(match_ts, errors='coerce')
+                    beste_osm_datum = dt.tz_localize(None) if pd.notna(dt) and dt.tzinfo else dt
 
-    if not knw_type:
-        return new_props
+        if best_coverage_grb == 0.0:
+            filtered_indices.append(idx)
+            continue
 
-    if knw_type == 'cabine':
-        new_props['building'] = 'service'
-    elif knw_type.startswith('silo'):
-        new_props['building'] = 'silo'
-    else:
-        new_props['building'] = knw_type
+        is_nagenoeg_gelijk = (abs(grb_area - best_osm_area) / best_osm_area) < 0.02 if best_osm_area > 0 else False
+        grb_is_recenter = (grb_datum > beste_osm_datum) if (pd.notna(grb_datum) and pd.notna(beste_osm_datum)) else False
 
-    return new_props
+        if is_nagenoeg_gelijk:
+            if grb_is_recenter:
+                filtered_indices.append(idx)
+        else:
+            if not (beste_osm_datum and pd.notna(grb_datum) and not grb_is_recenter and grb_area >= best_osm_area):
+                filtered_indices.append(idx)
 
-
-def laad_en_prepareer_data(args, bbox, config):
-    print(f"Bounding box uitlezen uit {args.osm_bestand}...")
-
-    gdf_poly = haal_wfs_data_op("GRB:GBG", bbox)
-    gdf_poly['grb_layer'] = 'Gbg'
-    gdf_gba  = haal_wfs_data_op("GRB:GBA", bbox)
-    gdf_gba['grb_layer'] = 'Gba'
-    gdf_addr = haal_wfs_data_op("GRB:Adres", bbox)
-    gdf_wsm  = haal_wfs_data_op("GRB:Wegsegment", bbox)
-    gdf_knw = haal_wfs_data_op("GRB:KNW", bbox)
-    gdf_knw['grb_layer'] = 'Knw'
-
-    if gdf_poly.empty:
-        print("Geen gebouwen gevonden in de WFS voor deze bounding box.", file=sys.stderr)
-        sys.exit(0)
-
-    print(f"Succesvol {len(gdf_poly)} gebouwen, {len(gdf_gba)} bijgebouwen, {len(gdf_addr)} adrespunten en {len(gdf_wsm)} wegsegmenten opgehaald via WFS.")
-
-    if not gdf_addr.empty and gdf_poly.crs != gdf_addr.crs:
-        gdf_addr = gdf_addr.to_crs(gdf_poly.crs)
-    if not gdf_wsm.empty and gdf_poly.crs != gdf_wsm.crs:
-        gdf_wsm = gdf_wsm.to_crs(gdf_poly.crs)
-    if not gdf_gba.empty and gdf_poly.crs != gdf_gba.crs:
-        gdf_gba = gdf_gba.to_crs(gdf_poly.crs)
-    if not gdf_knw.empty and gdf_poly.crs != gdf_knw.crs:
-        gdf_knw = gdf_knw.to_crs(gdf_poly.crs)
-
-    mapping_columns = {}
-    for col in ["HUISNR", "huisnummer", "Huisnummer"]:
-        if col in gdf_addr.columns:
-            mapping_columns[col] = "addr:housenumber"
-    for col in ["STRAATNM", "straatnaam", "Straatnaam"]:
-        if col in gdf_addr.columns:
-            mapping_columns[col] = "addr:street"
-
-    sub_addr = gdf_addr[[c for c in mapping_columns.keys()] + ['geometry']].copy()
-    sub_addr = sub_addr.rename(columns=mapping_columns)
-
-    existing_osm_addresses = get_existing_osm_addresses_in_lambert2008(args.osm_bestand)
-
-    # 1. Schoon de indexen op om conflicten bij de join te vermijden
-    gdf_poly = gdf_poly.reset_index(drop=True)
-    if not gdf_knw.empty:
-        gdf_knw = gdf_knw.reset_index(drop=True)
-
-    # 2. Voeg GBG en KNW samen VÓÓR de adreskoppeling zodat KNW ook adressen ontvangt
-    te_koppelen_objecten = gdf_poly.copy()
-    if not gdf_knw.empty:
-        te_koppelen_objecten = pd.concat([te_koppelen_objecten, gdf_knw], ignore_index=True)
-
-    print("Bezig met slim koppelen en sorteren van adressen aan GBG en KNW gebouwen...")
-    import_losse_knopen = config.get('addressing', {}).get('import_loose_address_nodes', False)
-
-    gekoppeld, extra_address_nodes = koppel_adressen_aan_gbg(
-        gdf_poly=te_koppelen_objecten,
-        sub_addr=sub_addr,
-        gdf_wsm=gdf_wsm,
-        existing_osm_addresses=existing_osm_addresses,
-        import_loose_address_nodes=import_losse_knopen
-    )
-
-    if not config.get('addressing', {}).get('import_loose_address_nodes', False):
-        print("Opmerking: Losse adrespunten worden genegeerd (instelling 'addressing.import_loose_address_nodes').")
-        extra_address_nodes = []
-
-    if not gdf_gba.empty and 'TYPE' in gdf_gba.columns:
-        gdf_gba['TYPE'] = pd.to_numeric(gdf_gba['TYPE'], errors='coerce')
-        aantal_voor = len(gdf_gba)
-        gdf_gba = gdf_gba[gdf_gba['TYPE'] != 6]
-        print(f"GBA gefilterd: {len(gdf_gba)} over ({aantal_voor - len(gdf_gba)} garagetoegangen verwijderd).")
-
-    if not gdf_knw.empty and 'TYPE' in gdf_knw.columns:
-        gdf_knw['TYPE'] = pd.to_numeric(gdf_knw['TYPE'], errors='coerce')
-        uitsluitingen = [4, 5, 6, 12, 14, 22, 23, 24]
-        aantal_voor = len(gdf_knw)
-        gdf_knw = gdf_knw[~gdf_knw['TYPE'].isin(uitsluitingen)]
-        print(f"KNW gefilterd: {len(gdf_knw)} over ({aantal_voor - len(gdf_knw)} technische/waterbouwkundige objecten verwijderd).")
-
-    # 3. Voeg uitsluitend GBA toe (zonder adreskoppeling)
-    # KNW zit immers al in 'gekoppeld' via 'te_koppelen_objecten'
-    if not gdf_gba.empty:
-        gekoppeld = pd.concat([gekoppeld, gdf_gba], ignore_index=True)
-
-    gekoppeld['wkt'] = gekoppeld['geometry'].apply(lambda g: g.wkt if g else "")
-    gekoppeld = gekoppeld.drop_duplicates(subset=['wkt'], keep='first').drop(columns=['wkt'])
-
-    if gekoppeld.crs is None or "3812" not in str(gekoppeld.crs.to_string()):
-        gekoppeld = gekoppeld.to_crs("EPSG:3812")
-
-    gekoppeld['geometry'] = gekoppeld['geometry'].buffer(0)
-    gekoppeld = gekoppeld.explode(index_parts=False).reset_index(drop=True)
-
-    gekoppeld = gekoppeld[gekoppeld.geometry.area >= 1.0]
-
-    existing_osm_polys = get_existing_osm_polys_met_meta(args.osm_bestand)
-
-    filtering_actief = config.get('filtering', {}).get('active', True) and not args.fno
-    drempelwaarde = config.get('filtering', {}).get('overlap_threshold', 0.95)
-
-    if filtering_actief:
-        print(f"Filtering actief: controleert GRB-gebouwen tegen OSM met overlapdrempel van {drempelwaarde * 100:.0f}%...")
-        gekoppeld = filter_existing_gdf(gekoppeld, existing_osm_polys, threshold=drempelwaarde)
-    else:
-        print("Filtering uitgeschakeld: alle GRB-gebouwen worden meegenomen.")
-
-    return gekoppeld, extra_address_nodes, existing_osm_polys, gdf_poly
+    return gdf_grb.loc[filtered_indices].copy()
 
 
-def verwerk_topologie_en_simplificatie(gekoppeld, originele_bbox_wgs84, config):
-    gekoppeld.to_crs("EPSG:4326").to_file("debug_1_ruwe_polygonen.geojson", driver="GeoJSON")
-    print("--> Dump 1 opgeslagen: debug_1_ruwe_polygonen.geojson")
+def verwerk_topologie_en_simplificatie(gekoppeld, bbox_wgs84, config):
+    if gekoppeld.empty:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
+    gekoppeld = gekoppeld.copy()
     gekoppeld['geometry'] = gekoppeld['geometry'].apply(lambda geom: set_precision(geom, grid_size=0.001))
 
     TOLERANCE_METERS = config.get('topology', {}).get('tolerance_meters', 0.05)
     GEWENSTE_STAP_METER = config.get('topology', {}).get('gewenste_stap_meter', 0.01)
 
-    print(f"Stap 1/2: TopoJSON netwerk opbouwen voor {len(gekoppeld)} gebouw(en) (tolerance={TOLERANCE_METERS}m)...")
+    total_bounds = gekoppeld.total_bounds
+    langste_zijde = max(total_bounds[2] - total_bounds[0], total_bounds[3] - total_bounds[1])
+    quant = int(langste_zijde / GEWENSTE_STAP_METER) if langste_zijde > 0 else 1000
 
-    sindex = gekoppeld.sindex
-    connected_indices = set()
+    topo = tp.Topology(gekoppeld, prequantize=quant).toposimplify(TOLERANCE_METERS).to_gdf()
+    topo.index = gekoppeld.index
+    topo['geometry'] = topo['geometry'].buffer(0)
 
-    for idx, geom in gekoppeld.geometry.items():
-        if geom is None or geom.is_empty:
-            continue
-        possible_matches = list(sindex.query(geom, predicate="intersects"))
-        if [m for m in possible_matches if m != idx]:
-            connected_indices.add(idx)
+    gdf_simplified = topo.to_crs("EPSG:4326")
+    box_wgs84 = box(*bbox_wgs84)
+    return gdf_simplified[gdf_simplified.geometry.intersects(box_wgs84)].copy()
 
-    gdf_connected = gekoppeld.loc[list(connected_indices)].copy()
-    gdf_isolated = gekoppeld.loc[~gekoppeld.index.isin(connected_indices)].copy()
-    gdf_connected.to_crs("EPSG:4326").to_file("debug_2gekoppeld_voor_topojson.geojson", driver="GeoJSON")
 
-    total_bounds = gdf_connected.total_bounds
-    if len(gdf_connected) == 0 or np.isnan(total_bounds[0]):
-        dynamische_prequantize = 1000
+def verwerk_grb_data(grb_lagen, osm_ctx, config, args):
+    """Combineert filtering, adreskoppeling en simplificatie."""
+    gdf_poly = grb_lagen['gbg'].reset_index(drop=True)
+    gdf_gba = grb_lagen['gba']
+    gdf_knw = grb_lagen['knw'].reset_index(drop=True) if not grb_lagen['knw'].empty else grb_lagen['knw']
+    gdf_addr = grb_lagen['adres']
+    gdf_wsm = grb_lagen['wegsegment']
+
+    if gdf_poly.empty:
+        print("Geen gebouwen gevonden in GRB.", file=sys.stderr)
+        sys.exit(0)
+
+    # Filter GBA & KNW op type
+    if not gdf_gba.empty and 'TYPE' in gdf_gba.columns:
+        gdf_gba['TYPE'] = pd.to_numeric(gdf_gba['TYPE'], errors='coerce')
+        gdf_gba = gdf_gba[gdf_gba['TYPE'] != 6]
+
+    if not gdf_knw.empty and 'TYPE' in gdf_knw.columns:
+        gdf_knw['TYPE'] = pd.to_numeric(gdf_knw['TYPE'], errors='coerce')
+        gdf_knw = gdf_knw[~gdf_knw['TYPE'].isin([4, 5, 6, 12, 14, 22, 23, 24])]
+
+    # Prepareer adressen
+    mapping_columns = {}
+    for col in ["HUISNR", "huisnummer", "Huisnummer"]:
+        if col in gdf_addr.columns: mapping_columns[col] = "addr:housenumber"
+    for col in ["STRAATNM", "straatnaam", "Straatnaam"]:
+        if col in gdf_addr.columns: mapping_columns[col] = "addr:street"
+
+    sub_addr = gdf_addr[[c for c in mapping_columns.keys()] + ['geometry']].rename(columns=mapping_columns)
+
+    # Voeg GBG en KNW samen VOOR de adreskoppeling (KNW kan adressen hebben)
+    te_koppelen_objecten = pd.concat([gdf_poly, gdf_knw], ignore_index=True) if not gdf_knw.empty else gdf_poly
+
+    import_losse_knopen = config.get('addressing', {}).get('import_loose_address_nodes', False)
+    gekoppeld, extra_address_nodes = koppel_adressen(
+        gdf_poly=te_koppelen_objecten,
+        sub_addr=sub_addr,
+        gdf_wsm=gdf_wsm,
+        existing_osm_addresses=osm_ctx.existing_addresses_buffered_3812,
+        import_loose_address_nodes=import_losse_knopen
+    )
+
+    # Voeg GBA toe ZONDER adreskoppeling
+    if not gdf_gba.empty:
+        gekoppeld = pd.concat([gekoppeld, gdf_gba], ignore_index=True)
+
+    gekoppeld['wkt'] = gekoppeld['geometry'].apply(lambda g: g.wkt if g else "")
+    gekoppeld = gekoppeld.drop_duplicates(subset=['wkt'], keep='first').drop(columns=['wkt'])
+    gekoppeld['geometry'] = gekoppeld['geometry'].buffer(0)
+    gekoppeld = gekoppeld.explode(index_parts=False).reset_index(drop=True)
+    gekoppeld = gekoppeld[gekoppeld.geometry.area >= 1.0]
+
+    # Filtering tegen bestaande OSM gebouwen
+    filtering_actief = config.get('filtering', {}).get('active', True) and not args.fno
+    if filtering_actief:
+        gekoppeld = filter_existing_gdf(gekoppeld, osm_ctx.existing_polys_3812, threshold=config.get('filtering', {}).get('overlap_threshold', 0.95))
+
+    # Topologie en vereenvoudiging
+    gdf_simplified = verwerk_topologie_en_simplificatie(gekoppeld, osm_ctx.bbox_wgs84, config)
+
+    return gdf_simplified, extra_address_nodes
+
+
+# ==============================================================================
+# 4. TAGGING & MAPPING (GBG / GBA / KNW)
+# ==============================================================================
+
+def verwerk_gba_attributen(props):
+    new_props = {}
+    gba_type = props.get('TYPE') or props.get('type')
+    try: gba_type_int = int(gba_type)
+    except (ValueError, TypeError): gba_type_int = None
+
+    if gba_type_int == 2: new_props['building'] = 'roof'
+    elif gba_type_int == 3: new_props.update({'building:part': 'corridor', 'building:min_level': '1', 'building:levels': '2'})
+    elif gba_type_int == 1: new_props.update({'building:part': 'yes', 'building:min_level': '1', 'building:levels': '2'})
+    elif gba_type_int == 4: new_props['building:part'] = 'steps'
+    else: new_props['building:part'] = 'yes'
+
+    return new_props
+
+
+def verwerk_knw_attributen(props):
+    knw_type = str(props.get('LBLTYPE', '')).lower()
+    if not knw_type:
+        return None
+
+    new_props = {}
+    if knw_type == 'cabine':
+        new_props['building'] = 'service'
+    elif knw_type.startswith('silo'):
+        new_props['building'] = 'silo'
+    elif knw_type.startswith('watertoren'):
+        new_props['man_made'] = 'water_tower'
     else:
-        langste_zijde = max(total_bounds[2] - total_bounds[0], total_bounds[3] - total_bounds[1])
-        dynamische_prequantize = int(langste_zijde / GEWENSTE_STAP_METER) if langste_zijde > 0 else 1000
+        # Sla ongewenste KNW types over
+        return None
 
-    processed_parts = []
+    return new_props
 
-    if not gdf_connected.empty:
-        topo = tp.Topology(gdf_connected, prequantize=dynamische_prequantize)
-        topo_simplified = topo.toposimplify(TOLERANCE_METERS)
-        processed_gdf = topo_simplified.to_gdf()
-        processed_gdf.index = gdf_connected.index
-        processed_gdf['geometry'] = processed_gdf['geometry'].buffer(0)
-        processed_parts.append(processed_gdf)
 
-    if not gdf_isolated.empty:
-        topo_iso = tp.Topology(gdf_isolated, prequantize=dynamische_prequantize)
-        gdf_isolated = topo_iso.toposimplify(TOLERANCE_METERS).to_gdf()
-        processed_parts.append(gdf_isolated)
+def ken_osm_tags_toe(gdf_simplified, osm_ctx):
+    features_out = []
 
-    gdf_simplified = pd.concat(processed_parts, ignore_index=False).to_crs("EPSG:4326")
+    for idx, row in gdf_simplified.iterrows():
+        props = row.to_dict()
+        geom_obj = props.pop('geometry', None)
+        if not geom_obj or geom_obj.is_empty:
+            continue
 
-    box_wgs84 = box(originele_bbox_wgs84[0], originele_bbox_wgs84[1], originele_bbox_wgs84[2], originele_bbox_wgs84[3])
-    gdf_simplified = gdf_simplified[gdf_simplified.geometry.intersects(box_wgs84)].copy()
+        date_val = str(props.get('VERSDATUM') or props.get('begindatum') or '')[:10]
+        prefix = props.get('grb_layer', 'Gbg')
+        grb_laag = str(props.get('grb_layer', '')).upper()
+        oidn_val = props.get('OIDN') or props.get('id')
+        ref_val = f"{prefix}/{int(oidn_val)}" if oidn_val is not None and str(oidn_val).isdigit() else (f"Gbg/{oidn_val}" if oidn_val else None)
 
-    return gdf_simplified
+        housenumber = props.get('addr:housenumber')
+        heeft_adres = bool(housenumber and str(housenumber).strip() and str(housenumber).lower() != "nan")
+        in_farmyard = any(fy.intersects(geom_obj) for fy in osm_ctx.existing_farmyards_wgs84)
 
+        new_props = None
+
+        if grb_laag == 'GBA' or prefix == 'Gba':
+            new_props = verwerk_gba_attributen(props)
+            # GBA krijgt bewust GEEN adrestags
+
+        elif grb_laag == 'KNW' or prefix == 'Knw':
+            new_props = verwerk_knw_attributen(props)
+            if new_props is None:
+                continue  # DROPME / Niet ondersteund KNW type
+
+            for osm_tag in ["addr:street", "addr:housenumber", "fixme"]:
+                val = props.get(osm_tag)
+                if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
+                    new_props[osm_tag] = str(val)
+
+        else: # GBG
+            new_props = {}
+            new_props['building'] = ('farm' if heeft_adres else 'farm_auxiliary') if in_farmyard else ('house' if heeft_adres else 'yes')
+            for osm_tag in ["addr:street", "addr:housenumber", "fixme"]:
+                val = props.get(osm_tag)
+                if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
+                    new_props[osm_tag] = str(val)
+
+        if date_val: new_props['source:geometry:date'] = date_val
+        if ref_val: new_props['source:geometry:ref'] = ref_val
+
+        features_out.append({
+            "type": "Feature",
+            "properties": new_props,
+            "geometry": mapping(geom_obj)
+        })
+
+    return features_out
+
+
+# ==============================================================================
+# 5. EXPORT & JOSM INTEGRATIE
+# ==============================================================================
+
+def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path="to_check.txt", max_overlap_ratio=0.10, min_leeftijd_jaar=3):
+    if not osm_polys_met_meta or gdf_grb.empty:
+        return
+
+    BESCHERMDE_BUILDINGS = {'water_tower', 'bunker', 'bridge'}
+    BESCHERMDE_KEYS = {'man_made', 'historic', 'tourism', 'natural'}
+
+    osm_records = [
+        {'geometry': op['geom'], 'osm_id': op.get('osm_id'), 'timestamp': op.get('timestamp')}
+        for op in osm_polys_met_meta
+        if 'building' in op.get('tags', {}) and op.get('tags', {}).get('building') not in BESCHERMDE_BUILDINGS and not any(k in op.get('tags', {}) for k in BESCHERMDE_KEYS)
+    ]
+
+    if not osm_records:
+        return
+
+    osm_gdf = gpd.GeoDataFrame(osm_records, crs="EPSG:3812")
+    if gdf_grb.crs != "EPSG:3812":
+        gdf_grb = gdf_grb.to_crs("EPSG:3812")
+
+    grb_union = unary_union([g for g in gdf_grb.geometry if g and not g.is_empty])
+    osm_gdf['area'] = osm_gdf.geometry.area
+    osm_gdf = osm_gdf[osm_gdf['area'] > 0].copy()
+
+    intersections = osm_gdf.geometry.intersection(grb_union)
+    osm_gdf['overlap_ratio'] = intersections.area / osm_gdf['area']
+
+    huidige_tijd = pd.Timestamp.now()
+    leeftijd_grens_dagen = min_leeftijd_jaar * 365.25
+
+    def is_oud_genoeg(ts_val):
+        if pd.isna(ts_val): return True
+        ts = pd.to_datetime(ts_val, errors='coerce')
+        if pd.isna(ts): return True
+        return (huidige_tijd - (ts.tz_localize(None) if ts.tzinfo else ts)).days >= leeftijd_grens_dagen
+
+    wees_panden = osm_gdf[(osm_gdf['overlap_ratio'] < max_overlap_ratio) & osm_gdf['timestamp'].apply(is_oud_genoeg)]
+    ids_schoon = list(dict.fromkeys(["".join(filter(str.isdigit, str(oid))) for oid in wees_panden['osm_id'].dropna() if str(oid)]))
+
+    if ids_schoon:
+        zoek_string = "type:way (" + " or ".join([f"id:{oid}" for oid in ids_schoon]) + ")"
+        with open(output_path, "w") as f:
+            f.write(zoek_string)
+        print(f"JOSM-zoekstring voor {len(ids_schoon)} verouderde wees-panden opgeslagen in '{output_path}'.")
+
+
+def exporteer_geojson(features_out, extra_address_nodes, osm_bestand):
+    if extra_address_nodes:
+        print(f"--> {len(extra_address_nodes)} extra samengevoegde adresnode(s) aangemaakt.")
+        gdf_extra = gpd.GeoDataFrame(extra_address_nodes, crs="EPSG:3812").to_crs("EPSG:4326")
+        for _, ext_row in gdf_extra.iterrows():
+            if ext_row['geometry'] and not ext_row['geometry'].is_empty:
+                ext_props = {"addr:street": ext_row['addr:street'], "addr:housenumber": ext_row['addr:housenumber']}
+                if 'fixme' in ext_row and pd.notna(ext_row['fixme']): ext_props['fixme'] = ext_row['fixme']
+                features_out.append({"type": "Feature", "properties": ext_props, "geometry": mapping(ext_row['geometry'])})
+
+    output_geojson = {
+        "type": "FeatureCollection",
+        "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}},
+        "features": features_out
+    }
+
+    input_dir = os.path.dirname(osm_bestand) if os.path.dirname(osm_bestand) else "."
+    base_filename = os.path.splitext(os.path.basename(osm_bestand))[0]
+    output_filepath = os.path.join(input_dir, f"{base_filename}_grb.geojson")
+
+    with open(output_filepath, 'w', encoding='utf-8') as f:
+        json.dump(output_geojson, f, ensure_ascii=False, indent=2)
+
+    return output_filepath
+
+
+def open_in_josm(output_filepath):
+    print("Bezig met openen in JOSM...")
+    try:
+        abs_output_path = os.path.abspath(output_filepath)
+        full_url = f"http://127.0.0.1:8111/open_file?{urllib.parse.urlencode({'filename': abs_output_path})}"
+        with urllib.request.urlopen(full_url, timeout=3.0) as response:
+            if response.status == 200:
+                print("Succes! Het bestand is geopend in JOSM.")
+    except Exception as e:
+        print(f"Kon JOSM Remote Control niet bereiken: {e}", file=sys.stderr)
+
+
+# ==============================================================================
+# 6. HOOFDPROGRAMMA (PIJPLIJN)
+# ==============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Leest een JOSM .osm-bestand en haalt GRB-gebouwen op.")
@@ -1180,160 +839,25 @@ def main():
         print(f"Fout: Het bestand '{args.osm_bestand}' is niet gevonden.", file=sys.stderr)
         sys.exit(1)
 
+    # 1. EXTRACT
     config = laad_configuratie(args.config)
+    osm_ctx = OsmContext(args.osm_bestand)
+    grb_lagen = haal_alle_grb_lagen_op(osm_ctx.bbox_3812)
 
-    try:
-        originele_bbox_wgs84 = lees_bbox_uit_osm(args.osm_bestand)
-        minlon, minlat, maxlon, maxlat = originele_bbox_wgs84
+    # 2. TRANSFORM
+    gdf_simplified, extra_address_nodes = verwerk_grb_data(grb_lagen, osm_ctx, config, args)
 
-        to_lambert = Transformer.from_crs('EPSG:4326', 'EPSG:3812', always_xy=True)
-        minx, miny = to_lambert.transform(minlon, minlat)
-        maxx, maxy = to_lambert.transform(maxlon, maxlat)
+    # 3. TAGGING
+    features_out = ken_osm_tags_toe(gdf_simplified, osm_ctx)
 
-        buffer = 100.0
-        bbox_3812 = (
-            minx - buffer,
-            miny - buffer,
-            maxx + buffer,
-            maxy + buffer
-        )
-
-    except Exception as e:
-        print(e, file=sys.stderr)
-        sys.exit(1)
-
-    gekoppeld, extra_address_nodes, existing_osm_polys, gdf_poly = laad_en_prepareer_data(args, bbox_3812, config)
-    gdf_simplified = verwerk_topologie_en_simplificatie(gekoppeld, originele_bbox_wgs84, config)
-
-    exporteer_verouderde_osm_zoekstring(
-        osm_polys_met_meta=existing_osm_polys,
-        gdf_grb=gdf_poly,
-        output_path="to_check.txt"
-    )
-
-    print("Stap 2/2: Verwerken van tags, adrescorrecties en GeoJSON export...")
-    features_out = []
-
-    existing_farmyards = get_existing_osm_farmyards_in_wgs84(args.osm_bestand)
-
-    for idx, row in gdf_simplified.iterrows():
-        props = row.to_dict()
-        geom_obj = props.pop('geometry', None)
-
-        if not geom_obj or geom_obj.is_empty:
-            continue
-
-        date_val = props.get('VERSDATUM') or props.get('begindatum')
-        if date_val:
-            date_val = str(date_val)[:10]
-
-        prefix = props.get('grb_layer', 'Gbg')
-        grb_laag = str(props.get('grb_layer', '')).upper()
-
-        oidn_val = props.get('OIDN') or props.get('id')
-        ref_val = f"{prefix}/{int(oidn_val)}" if oidn_val is not None and str(oidn_val).isdigit() else (f"Gbg/{oidn_val}" if oidn_val else None)
-
-        housenumber = props.get('addr:housenumber')
-        heeft_adres = bool(housenumber and str(housenumber).strip() and str(housenumber).lower() != "nan")
-
-        in_farmyard = False
-        if existing_farmyards:
-            in_farmyard = any(fy.intersects(geom_obj) for fy in existing_farmyards)
-
-        new_props = {}
-
-        if grb_laag == 'GBA' or prefix == 'Gba':
-            new_props = verwerk_gba_attributen(props)
-
-        elif grb_laag == 'KNW' or prefix == 'Knw':
-            new_props = verwerk_knw_attributen(props)
-            for osm_tag in ["addr:street", "addr:housenumber", "fixme"]:
-                val = props.get(osm_tag)
-                if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
-                    new_props[osm_tag] = str(val)
-
-        else:
-            if in_farmyard:
-                building_val = 'farm' if heeft_adres else 'farm_auxiliary'
-            else:
-                building_val = 'house' if heeft_adres else 'yes'
-            new_props['building'] = building_val
-
-            for osm_tag in ["addr:street", "addr:housenumber", "fixme"]:
-                val = props.get(osm_tag)
-                if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
-                    new_props[osm_tag] = str(val)
-
-        if date_val:
-            new_props['source:geometry:date'] = date_val
-        if ref_val:
-            new_props['source:geometry:ref'] = ref_val
-
-        features_out.append({
-            "type": "Feature",
-            "properties": new_props,
-            "geometry": mapping(geom_obj)
-        })
-
-    if extra_address_nodes:
-        print(f"--> {len(extra_address_nodes)} extra samengevoegde adresnode(s) aangemaakt.")
-        gdf_extra = gpd.GeoDataFrame(extra_address_nodes, crs="EPSG:3812").to_crs("EPSG:4326")
-        for _, ext_row in gdf_extra.iterrows():
-            ext_geom = ext_row['geometry']
-            if not ext_geom or ext_geom.is_empty:
-                continue
-            ext_props = {
-                "addr:street": ext_row['addr:street'],
-                "addr:housenumber": ext_row['addr:housenumber']
-            }
-            if 'fixme' in ext_row and pd.notna(ext_row['fixme']):
-                ext_props['fixme'] = ext_row['fixme']
-
-            features_out.append({
-                "type": "Feature",
-                "properties": ext_props,
-                "geometry": mapping(ext_geom)
-            })
-
-    output_geojson = {
-        "type": "FeatureCollection",
-        "crs": {
-            "type": "name",
-            "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" }
-        },
-        "features": features_out
-    }
-
-    input_dir = os.path.dirname(args.osm_bestand) if os.path.dirname(args.osm_bestand) else "."
-    base_filename = os.path.splitext(os.path.basename(args.osm_bestand))[0]
-    output_filepath = os.path.join(input_dir, f"{base_filename}_grb.geojson")
-
-    with open(output_filepath, 'w', encoding='utf-8') as f:
-        json.dump(output_geojson, f, ensure_ascii=False, indent=2)
+    # 4. EXPORT
+    exporteer_verouderde_osm_zoekstring(osm_ctx.existing_polys_3812, grb_lagen['gbg'], output_path="to_check.txt")
+    output_filepath = exporteer_geojson(features_out, extra_address_nodes, args.osm_bestand)
 
     print(f"\nSucces! Het bestand is gegenereerd op basis van de bounding box uit {args.osm_bestand}.")
     print(f"Klaar voor JOSM: {output_filepath}")
 
-    print("Bezig met openen in JOSM...")
-    try:
-        abs_output_path = os.path.abspath(output_filepath)
-        josm_url = "http://127.0.0.1:8111/open_file"
-        params = {"filename": abs_output_path}
-        full_url = f"{josm_url}?{urllib.parse.urlencode(params)}"
-
-        with urllib.request.urlopen(full_url, timeout=3.0) as response:
-            if response.status == 200:
-                print("Succes! Het bestand is geopend in JOSM.")
-            else:
-                print(f"Waarschuwing: JOSM reageerde met status {response.status}", file=sys.stderr)
-
-    except urllib.error.HTTPError as e:
-        error_message = e.read().decode('utf-8', errors='ignore')
-        print(f"Kon JOSM Remote Control niet bereiken (HTTP {e.code}): {e.reason}", file=sys.stderr)
-        if error_message:
-            print(f"JOSM melding: {error_message}", file=sys.stderr)
-    except Exception as e:
-        print(f"Kon JOSM Remote Control niet bereiken: {e}", file=sys.stderr)
+    open_in_josm(output_filepath)
 
 
 if __name__ == "__main__":
