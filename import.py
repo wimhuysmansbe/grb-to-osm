@@ -25,7 +25,7 @@ from pyproj import Transformer
 logging.basicConfig(filename='adres_koppelingen.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def laad_configuratie(config_pad="config.yaml"):
+def laad_configuratie(config_pad="tuning.yaml"):
     """Laadt de tuning-parameters uit een YAML-bestand of valt terug op standaarden."""
     standaard_config = {
         'filtering': {
@@ -46,9 +46,8 @@ def laad_configuratie(config_pad="config.yaml"):
             with open(config_pad, 'r', encoding='utf-8') as f:
                 geladen_config = yaml.safe_load(f)
                 if isinstance(geladen_config, dict):
-                    # Samenvoegen met standaarden
                     for sectie, waarden in geladen_config.items():
-                        if sectie in standaard_config and isinstancewaarde(waarden, dict):
+                        if sectie in standaard_config and isinstance(waarden, dict):
                             standaard_config[sectie].update(waarden)
                         else:
                             standaard_config[sectie] = waarden
@@ -62,7 +61,6 @@ def laad_configuratie(config_pad="config.yaml"):
     return standaard_config
 
 
-# Vormt lange reeksen huisnummers om naar handelbaar formaat
 def formatteer_huisnummers(huisnummers):
     if not huisnummers:
         return None
@@ -93,7 +91,6 @@ def formatteer_huisnummers(huisnummers):
     if pure_nums:
         num_ints = sorted(list(set(pure_nums)))
 
-        # Groepeer in sub-reeksen (chunks met constante stap 1 of 2)
         if num_ints:
             chunks = []
             current_chunk = [num_ints[0]]
@@ -141,7 +138,6 @@ def formatteer_huisnummers(huisnummers):
 
 
 def lees_bbox_uit_osm(osm_pad):
-    """Leest de bounding box coördinaten in WGS84 uit een JOSM .osm-bestand."""
     try:
         tree = ET.parse(osm_pad)
         root = tree.getroot()
@@ -166,7 +162,6 @@ def lees_bbox_uit_osm(osm_pad):
 
 
 def get_existing_osm_polys_met_meta(osm_pad):
-    """Parseert bestaande gebouwen en building:parts incl. timestamp en metadata uit het JOSM .osm-bestand en transformeert ze naar EPSG:3812."""
     try:
         tree = ET.parse(osm_pad)
         root = tree.getroot()
@@ -296,7 +291,6 @@ def get_existing_osm_polys_met_meta(osm_pad):
 
 
 def get_existing_osm_farmyards_in_wgs84(osm_pad):
-    """Parseert bestaande landuse=farmyard polygonen uit het JOSM .osm-bestand in native EPSG:4326."""
     try:
         tree = ET.parse(osm_pad)
         root = tree.getroot()
@@ -334,7 +328,6 @@ def get_existing_osm_farmyards_in_wgs84(osm_pad):
 
 
 def get_existing_osm_addresses_in_lambert2008(osm_pad):
-    """Parseert alle bestaande OSM elementen die een 'addr:housenumber' tag bevatten."""
     try:
         tree = ET.parse(osm_pad)
         root = tree.getroot()
@@ -383,8 +376,6 @@ def get_existing_osm_addresses_in_lambert2008(osm_pad):
 
 
 def filter_existing_gdf(gdf_grb, osm_polys_met_meta, threshold=0.95):
-    """Filtert GRB-gebouwen weg op basis van de beste individuele OSM match (gebouw of building:part),
-    tenzij het GRB-gebouw recenter is dan de bestaande OSM-intekening."""
     if not osm_polys_met_meta or gdf_grb.empty:
         return gdf_grb
 
@@ -570,7 +561,6 @@ def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path
 
 
 def haal_wfs_data_op(typename, bbox_3812):
-    """Haalt GeoJSON data direct op in Lambert 2008 (EPSG:3812) via WFS."""
     base_url = "https://geo.api.vlaanderen.be/GRB/wfs"
 
     params = {
@@ -619,27 +609,27 @@ def force_shared_nodes_geometries(gdf):
 
 
 def vul_gaten_van_polygoon(geom):
-  if geom is None or geom.is_empty:
-    return geom
+    if geom is None or geom.is_empty:
+        return geom
 
-  if geom.geom_type == 'Polygon':
-    return Polygon(geom.exterior)
-  elif geom.geom_type == 'MultiPolygon':
-    solide_delen = [Polygon(p.exterior) for p in geom.geoms]
-    return MultiPolygon(solide_delen)
-  return geom
+    if geom.geom_type == 'Polygon':
+        return Polygon(geom.exterior)
+    elif geom.geom_type == 'MultiPolygon':
+        solide_delen = [Polygon(p.exterior) for p in geom.geoms]
+        return MultiPolygon(solide_delen)
+    return geom
 
 
 def veilige_convex_hull_per_part(geom):
-  if geom is None or geom.is_empty:
-    return geom
+    if geom is None or geom.is_empty:
+        return geom
 
-  if geom.geom_type == 'Polygon':
+    if geom.geom_type == 'Polygon':
+        return geom.convex_hull
+    elif geom.geom_type == 'MultiPolygon':
+        hulls = [p.convex_hull for p in geom.geoms]
+        return unary_union(hulls)
     return geom.convex_hull
-  elif geom.geom_type == 'MultiPolygon':
-    hulls = [p.convex_hull for p in geom.geoms]
-    return unary_union(hulls)
-  return geom.convex_hull
 
 
 def koppel_adressen_aan_gbg(
@@ -650,352 +640,353 @@ def koppel_adressen_aan_gbg(
     filter_osmadressen=False,
     import_loose_address_nodes=False,
 ):
-  extra_address_nodes = []
+    extra_address_nodes = []
 
-  if sub_addr.empty or gdf_poly.empty:
-    gekoppeld = gdf_poly.copy()
-    gekoppeld['addr:street'] = None
-    gekoppeld['addr:housenumber'] = None
-    return gekoppeld, extra_address_nodes
+    if sub_addr.empty or gdf_poly.empty:
+        gekoppeld = gdf_poly.copy()
+        gekoppeld['addr:street'] = None
+        gekoppeld['addr:housenumber'] = None
+        return gekoppeld, extra_address_nodes
 
-  proj_poly = gdf_poly.copy()
-  proj_poly['orig_index'] = proj_poly.index
-  proj_addr = sub_addr.copy()
-  proj_wsm = gdf_wsm.copy()
+    proj_poly = gdf_poly.copy()
+    proj_poly['orig_index'] = proj_poly.index
+    proj_addr = sub_addr.copy()
+    proj_wsm = gdf_wsm.copy()
 
-  intersect_join = gpd.sjoin(
-      proj_addr, proj_poly, how='inner', predicate='intersects'
-  )
-
-  matched_addr_indices = (
-      set(intersect_join.index) if not intersect_join.empty else set()
-  )
-  unmatched_addr = proj_addr.loc[
-      ~proj_addr.index.isin(matched_addr_indices)
-  ].copy()
-
-  if filter_osmadressen and existing_osm_addresses and not unmatched_addr.empty:
-    filtered_unmatched_indices = []
-    for idx, row in unmatched_addr.iterrows():
-      pt = row['geometry']
-      if not pt or pt.is_empty:
-        continue
-      reeds_aanwezig = any(
-          buffered_poly.contains(pt)
-          for buffered_poly in existing_osm_addresses
-      )
-      if not reeds_aanwezig:
-        filtered_unmatched_indices.append(idx)
-    unmatched_addr = unmatched_addr.loc[filtered_unmatched_indices].copy()
-
-  nearest_join = None
-  if not unmatched_addr.empty and not proj_poly.empty:
-    nearest_join = gpd.sjoin_nearest(
-        unmatched_addr,
-        proj_poly,
-        how='inner',
-        distance_col='afstand_tot_gebouw',
-        max_distance=4.0,
+    intersect_join = gpd.sjoin(
+        proj_addr, proj_poly, how='inner', predicate='intersects'
     )
 
-  if nearest_join is not None and not nearest_join.empty:
-    matched_addr_indices.update(nearest_join.index)
-
-  hull_join = None
-  still_unmatched_addr = proj_addr.loc[
-      ~proj_addr.index.isin(matched_addr_indices)
-  ].copy()
-
-  if not still_unmatched_addr.empty and not proj_poly.empty:
-    gekoppelde_gebouw_indices = set()
-    if not intersect_join.empty:
-      gekoppelde_gebouw_indices.update(intersect_join['orig_index'])
-    if nearest_join is not None and not nearest_join.empty:
-      gekoppelde_gebouw_indices.update(nearest_join['orig_index'])
-
-    lege_gebouwen = proj_poly.loc[
-        ~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)
+    matched_addr_indices = (
+        set(intersect_join.index) if not intersect_join.empty else set()
+    )
+    unmatched_addr = proj_addr.loc[
+        ~proj_addr.index.isin(matched_addr_indices)
     ].copy()
 
-    if not lege_gebouwen.empty:
-      gevulde_gebouwen = []
-      for idx, g_row in lege_gebouwen.iterrows():
-        orig_geom = g_row['geometry']
-        if not orig_geom or orig_geom.is_empty:
-          continue
-        solide_geom = vul_gaten_van_polygoon(orig_geom)
-        g_row_solide = g_row.copy()
-        g_row_solide['geometry'] = solide_geom
-        gevulde_gebouwen.append(g_row_solide)
+    if filter_osmadressen and existing_osm_addresses and not unmatched_addr.empty:
+        filtered_unmatched_indices = []
+        for idx, row in unmatched_addr.iterrows():
+            pt = row['geometry']
+            if not pt or pt.is_empty:
+                continue
+            reeds_aanwezig = any(
+                buffered_poly.contains(pt)
+                for buffered_poly in existing_osm_addresses
+            )
+            if not reeds_aanwezig:
+                filtered_unmatched_indices.append(idx)
+        unmatched_addr = unmatched_addr.loc[filtered_unmatched_indices].copy()
 
-      gdf_solide = gpd.GeoDataFrame(
-          gevulde_gebouwen, crs=proj_poly.crs
-      ).reset_index(drop=True)
-      hull_join = gpd.sjoin(
-          still_unmatched_addr, gdf_solide, how='inner', predicate='intersects'
-      )
+    nearest_join = None
+    if not unmatched_addr.empty and not proj_poly.empty:
+        nearest_join = gpd.sjoin_nearest(
+            unmatched_addr,
+            proj_poly,
+            how='inner',
+            distance_col='afstand_tot_gebouw',
+            max_distance=4.0,
+        )
 
-      if not hull_join.empty:
-        matched_in_2a = set(hull_join.index)
-        still_unmatched_addr = still_unmatched_addr.loc[
-            ~still_unmatched_addr.index.isin(matched_in_2a)
-        ].copy()
-        gekoppelde_gebouw_indices.update(hull_join['orig_index'])
+    if nearest_join is not None and not nearest_join.empty:
+        matched_addr_indices.update(nearest_join.index)
+
+    hull_join = None
+    still_unmatched_addr = proj_addr.loc[
+        ~proj_addr.index.isin(matched_addr_indices)
+    ].copy()
+
+    if not still_unmatched_addr.empty and not proj_poly.empty:
+        gekoppelde_gebouw_indices = set()
+        if not intersect_join.empty:
+            gekoppelde_gebouw_indices.update(intersect_join['orig_index'])
+        if nearest_join is not None and not nearest_join.empty:
+            gekoppelde_gebouw_indices.update(nearest_join['orig_index'])
+
         lege_gebouwen = proj_poly.loc[
             ~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)
         ].copy()
 
-      if not still_unmatched_addr.empty and not lege_gebouwen.empty:
-        hull_gebouwen = []
-        for idx, g_row in lege_gebouwen.iterrows():
-          orig_geom = g_row['geometry']
-          if not orig_geom or orig_geom.is_empty:
-            continue
-          hull_geom = veilige_convex_hull_per_part(orig_geom)
-          g_row_hull = g_row.copy()
-          g_row_hull['geometry'] = hull_geom
-          hull_gebouwen.append(g_row_hull)
+        if not lege_gebouwen.empty:
+            gevulde_gebouwen = []
+            for idx, g_row in lege_gebouwen.iterrows():
+                orig_geom = g_row['geometry']
+                if not orig_geom or orig_geom.is_empty:
+                    continue
+                solide_geom = vul_gaten_van_polygoon(orig_geom)
+                g_row_solide = g_row.copy()
+                g_row_solide['geometry'] = solide_geom
+                gevulde_gebouwen.append(g_row_solide)
 
-        if hull_gebouwen:
-          gdf_hulls = gpd.GeoDataFrame(
-              hull_gebouwen, crs=proj_poly.crs
-          ).reset_index(drop=True)
-          convex_join = gpd.sjoin(
-              still_unmatched_addr,
-              gdf_hulls,
-              how='inner',
-              predicate='intersects',
-          )
-
-          if not convex_join.empty:
-            matched_in_2b = set(convex_join.index)
-            matched_addr_indices.update(matched_in_2b)
-            still_unmatched_addr = still_unmatched_addr.loc[
-                ~still_unmatched_addr.index.isin(matched_in_2b)
-            ].copy()
-
-          if hull_join is None or hull_join.empty:
-            hull_join = convex_join
-          elif not convex_join.empty:
-            hull_join = gpd.pd.concat(
-                [hull_join, convex_join], ignore_index=True
+            gdf_solide = gpd.GeoDataFrame(
+                gevulde_gebouwen, crs=proj_poly.crs
+            ).reset_index(drop=True)
+            hull_join = gpd.sjoin(
+                still_unmatched_addr, gdf_solide, how='inner', predicate='intersects'
             )
 
+            if not hull_join.empty:
+                matched_in_2a = set(hull_join.index)
+                still_unmatched_addr = still_unmatched_addr.loc[
+                    ~still_unmatched_addr.index.isin(matched_in_2a)
+                ].copy()
+                gekoppelde_gebouw_indices.update(hull_join['orig_index'])
+                lege_gebouwen = proj_poly.loc[
+                    ~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)
+                ].copy()
+
+            if not still_unmatched_addr.empty and not lege_gebouwen.empty:
+                hull_gebouwen = []
+                for idx, g_row in lege_gebouwen.iterrows():
+                    orig_geom = g_row['geometry']
+                    if not orig_geom or orig_geom.is_empty:
+                        continue
+                    hull_geom = veilige_convex_hull_per_part(orig_geom)
+                    g_row_hull = g_row.copy()
+                    g_row_hull['geometry'] = hull_geom
+                    hull_gebouwen.append(g_row_hull)
+
+                if hull_gebouwen:
+                    gdf_hulls = gpd.GeoDataFrame(
+                        hull_gebouwen, crs=proj_poly.crs
+                    ).reset_index(drop=True)
+                    convex_join = gpd.sjoin(
+                        still_unmatched_addr,
+                        gdf_hulls,
+                        how='inner',
+                        predicate='intersects',
+                    )
+
+                    if not convex_join.empty:
+                        matched_in_2b = set(convex_join.index)
+                        matched_addr_indices.update(matched_in_2b)
+                        still_unmatched_addr = still_unmatched_addr.loc[
+                            ~still_unmatched_addr.index.isin(matched_in_2b)
+                        ].copy()
+
+                    if hull_join is None or hull_join.empty:
+                        hull_join = convex_join
+                    elif not convex_join.empty:
+                        hull_join = pd.concat(
+                            [hull_join, convex_join], ignore_index=True
+                        )
+
+    # CORRECTIE: Gebruik 'addr:street' en 'addr:housenumber' direct
     if import_loose_address_nodes and not still_unmatched_addr.empty:
-      for _, row_unmatched in still_unmatched_addr.iterrows():
-        straat_val = row_unmatched.get('addr:street', row_unmatched.get('LSTRNM', ''))
-        huisnr_val = row_unmatched.get('addr:housenumber', row_unmatched.get('HUISNR', ''))
+        for _, row_unmatched in still_unmatched_addr.iterrows():
+            straat_val = row_unmatched.get('addr:street', '')
+            huisnr_val = row_unmatched.get('addr:housenumber', '')
 
-        extra_address_nodes.append({
-            'geometry': row_unmatched['geometry'],
-            'addr:street': straat_val,
-            'addr:housenumber': huisnr_val,
-            'fixme': 'Niet gekoppeld aan gebouw: behouden als los adrespunt.',
-        })
+            extra_address_nodes.append({
+                'geometry': row_unmatched['geometry'],
+                'addr:street': straat_val,
+                'addr:housenumber': huisnr_val,
+                'fixme': 'Niet gekoppeld aan gebouw: behouden als los adrespunt.',
+            })
 
-  all_matches = []
-  if not intersect_join.empty:
-    all_matches.append(intersect_join)
-  if nearest_join is not None and not nearest_join.empty:
-    all_matches.append(nearest_join)
-  if hull_join is not None and not hull_join.empty:
-    all_matches.append(hull_join)
+    all_matches = []
+    if not intersect_join.empty:
+        all_matches.append(intersect_join)
+    if nearest_join is not None and not nearest_join.empty:
+        all_matches.append(nearest_join)
+    if hull_join is not None and not hull_join.empty:
+        all_matches.append(hull_join)
 
-  combined_join = (
-      gpd.pd.concat(all_matches, ignore_index=True)
-      if all_matches
-      else gpd.GeoDataFrame()
-  )
-
-  if combined_join.empty or 'orig_index' not in combined_join.columns:
-    gekoppeld = proj_poly.copy()
-    gekoppeld['addr:street'] = None
-    gekoppeld['addr:housenumber'] = None
-    return gekoppeld, extra_address_nodes
-
-  adres_naar_gebouwen = {}
-  for _, row in combined_join.iterrows():
-    orig_idx = row['orig_index']
-    straat = str(row.get('addr:street', '')).strip().lower()
-    huisnr = str(row.get('addr:housenumber', '')).strip().lower()
-    if straat and huisnr and straat != 'nan' and huisnr != 'nan':
-      key = (straat, huisnr)
-      if key not in adres_naar_gebouwen:
-        adres_naar_gebouwen[key] = set()
-      adres_naar_gebouwen[key].add(orig_idx)
-
-  dubbele_adressen = {
-      k: v for k, v in adres_naar_gebouwen.items() if len(v) > 1
-  }
-  indices_to_drop = set()
-
-  if dubbele_adressen and proj_wsm is not None and not proj_wsm.empty:
-    straat_kolom = (
-        'LSTRNM'
-        if 'LSTRNM' in proj_wsm.columns
-        else next(
-            (
-                col
-                for col in [
-                    'STRAATNM',
-                    'straatnaam',
-                    'Straatnaam',
-                    'NAAM',
-                    'naam',
-                ]
-                if col in proj_wsm.columns
-            ),
-            None,
-        )
+    combined_join = (
+        pd.concat(all_matches, ignore_index=True)
+        if all_matches
+        else gpd.GeoDataFrame()
     )
 
-    for (straat, huisnr), gebouw_indices in dubbele_adressen.items():
-      sub_gebouwen = proj_poly.loc[proj_poly['orig_index'].isin(gebouw_indices)]
+    if combined_join.empty or 'orig_index' not in combined_join.columns:
+        gekoppeld = proj_poly.copy()
+        gekoppeld['addr:street'] = None
+        gekoppeld['addr:housenumber'] = None
+        return gekoppeld, extra_address_nodes
 
-      specifieke_segmenten = proj_wsm
-      if straat_kolom:
-        mask = (
-            proj_wsm[straat_kolom]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            == straat
+    adres_naar_gebouwen = {}
+    for _, row in combined_join.iterrows():
+        orig_idx = row['orig_index']
+        straat = str(row.get('addr:street', '')).strip().lower()
+        huisnr = str(row.get('addr:housenumber', '')).strip().lower()
+        if straat and huisnr and straat != 'nan' and huisnr != 'nan':
+            key = (straat, huisnr)
+            if key not in adres_naar_gebouwen:
+                adres_naar_gebouwen[key] = set()
+            adres_naar_gebouwen[key].add(orig_idx)
+
+    dubbele_adressen = {
+        k: v for k, v in adres_naar_gebouwen.items() if len(v) > 1
+    }
+    indices_to_drop = set()
+
+    if dubbele_adressen and proj_wsm is not None and not proj_wsm.empty:
+        straat_kolom = (
+            'LSTRNM'
+            if 'LSTRNM' in proj_wsm.columns
+            else next(
+                (
+                    col
+                    for col in [
+                        'STRAATNM',
+                        'straatnaam',
+                        'Straatnaam',
+                        'NAAM',
+                        'naam',
+                    ]
+                    if col in proj_wsm.columns
+                ),
+                None,
+            )
         )
-        gefilterd = proj_wsm[mask]
-        if not gefilterd.empty:
-          specifieke_segmenten = gefilterd
 
-      gebouw_afstanden = {}
-      for g_idx, g_row in sub_gebouwen.iterrows():
-        g_geom = g_row['geometry']
-        if g_geom and not g_geom.is_empty:
-          gebouw_afstanden[g_idx] = (
-              specifieke_segmenten.geometry.distance(g_geom).min()
-          )
+        for (straat, huisnr), gebouw_indices in dubbele_adressen.items():
+            sub_gebouwen = proj_poly.loc[proj_poly['orig_index'].isin(gebouw_indices)]
 
-      if gebouw_afstanden:
-        beste_g_idx = min(gebouw_afstanden, key=gebouw_afstanden.get)
-
-        for g_idx in gebouw_afstanden:
-          if g_idx != beste_g_idx:
-            foute_rows = combined_join[
-                (combined_join['orig_index'] == g_idx)
-                & (
-                    combined_join['addr:street'].str.strip().str.lower()
+            specifieke_segmenten = proj_wsm
+            if straat_kolom:
+                mask = (
+                    proj_wsm[straat_kolom]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
                     == straat
                 )
-                & (
-                    combined_join['addr:housenumber'].str.strip().str.lower()
-                    == huisnr
-                )
-            ]
-            indices_to_drop.update(foute_rows.index)
+                gefilterd = proj_wsm[mask]
+                if not gefilterd.empty:
+                    specifieke_segmenten = gefilterd
 
-  if indices_to_drop:
-    combined_join = combined_join.drop(index=list(indices_to_drop)).reset_index(
-        drop=True
-    )
+            gebouw_afstanden = {}
+            for g_idx, g_row in sub_gebouwen.iterrows():
+                g_geom = g_row['geometry']
+                if g_geom and not g_geom.is_empty:
+                    gebouw_afstanden[g_idx] = (
+                        specifieke_segmenten.geometry.distance(g_geom).min()
+                    )
 
-  df_addr_records = []
-  for orig_index, group in combined_join.groupby('orig_index'):
-    straten_raw = [
-        str(s).strip()
-        for s in group['addr:street'].dropna()
-        if str(s).strip() != '' and str(s).lower() != 'nan'
-    ]
-    if not straten_raw:
-      continue
-    primair_straat = max(set(straten_raw), key=straten_raw.count)
-    groep_primair = group[group['addr:street'] == primair_straat]
-    huisnummers_primair = sorted(
-        list({
-            str(h).strip()
-            for h in groep_primair['addr:housenumber'].dropna()
-            if str(h).strip() != ''
-        }),
-        key=sorteer_huisnummer,
-    )
+            if gebouw_afstanden:
+                beste_g_idx = min(gebouw_afstanden, key=gebouw_afstanden.get)
 
-    is_complex = False
-    if len(huisnummers_primair) > 1:
-      try:
-        nummers_int = sorted([
-            int(re.search(r'\d+', h).group())
-            for h in huisnummers_primair
-            if re.search(r'\d+', h)
-        ])
-        if len(nummers_int) == len(huisnummers_primair):
-          verschillen = [
-              nummers_int[i + 1] - nummers_int[i]
-              for i in range(len(nummers_int) - 1)
-          ]
-          if any(d not in (1, 2) for d in verschillen) and len(set(verschillen)) > 3:
-            is_complex = True
-        else:
-          is_complex = True
-      except Exception:
-        is_complex = True
+                for g_idx in gebouw_afstanden:
+                    if g_idx != beste_g_idx:
+                        foute_rows = combined_join[
+                            (combined_join['orig_index'] == g_idx)
+                            & (
+                                combined_join['addr:street'].str.strip().str.lower()
+                                == straat
+                            )
+                            & (
+                                combined_join['addr:housenumber'].str.strip().str.lower()
+                                == huisnr
+                            )
+                        ]
+                        indices_to_drop.update(foute_rows.index)
 
-    if is_complex:
-      for _, row_item in groep_primair.iterrows():
-        extra_address_nodes.append({
-            'geometry': row_item['geometry'],
-            'addr:street': row_item['addr:street'],
-            'addr:housenumber': row_item['addr:housenumber'],
-            'fixme': (
-                'Complexe/samengevoegde situaties: automatisch omgezet naar'
-                ' los adrespunt.'
-            ),
+    if indices_to_drop:
+        combined_join = combined_join.drop(index=list(indices_to_drop)).reset_index(
+            drop=True
+        )
+
+    df_addr_records = []
+    for orig_index, group in combined_join.groupby('orig_index'):
+        straten_raw = [
+            str(s).strip()
+            for s in group['addr:street'].dropna()
+            if str(s).strip() != '' and str(s).lower() != 'nan'
+        ]
+        if not straten_raw:
+            continue
+        primair_straat = max(set(straten_raw), key=straten_raw.count)
+        groep_primair = group[group['addr:street'] == primair_straat]
+        huisnummers_primair = sorted(
+            list({
+                str(h).strip()
+                for h in groep_primair['addr:housenumber'].dropna()
+                if str(h).strip() != ''
+            }),
+            key=sorteer_huisnummer,
+        )
+
+        is_complex = False
+        if len(huisnummers_primair) > 1:
+            try:
+                nummers_int = sorted([
+                    int(re.search(r'\d+', h).group())
+                    for h in huisnummers_primair
+                    if re.search(r'\d+', h)
+                ])
+                if len(nummers_int) == len(huisnummers_primair):
+                    verschillen = [
+                        nummers_int[i + 1] - nummers_int[i]
+                        for i in range(len(nummers_int) - 1)
+                    ]
+                    if any(d not in (1, 2) for d in verschillen) and len(set(verschillen)) > 3:
+                        is_complex = True
+                else:
+                    is_complex = True
+            except Exception:
+                is_complex = True
+
+        if is_complex:
+            for _, row_item in groep_primair.iterrows():
+                extra_address_nodes.append({
+                    'geometry': row_item['geometry'],
+                    'addr:street': row_item['addr:street'],
+                    'addr:housenumber': row_item['addr:housenumber'],
+                    'fixme': (
+                        'Complexe/samengevoegde situaties: automatisch omgezet naar'
+                        ' los adrespunt.'
+                    ),
+                })
+            continue
+
+        geformatteerde_nummers = formatteer_huisnummers(huisnummers_primair)
+
+        df_addr_records.append({
+            'orig_index': orig_index,
+            'addr:street': primair_straat,
+            'addr:housenumber': geformatteerde_nummers,
         })
-      continue
 
-    geformatteerde_nummers = formatteer_huisnummers(huisnummers_primair)
+    if df_addr_records:
+        df_addr_agg = pd.DataFrame(df_addr_records).set_index('orig_index')
+        gekoppeld = proj_poly.join(df_addr_agg, on='orig_index')
+    else:
+        gekoppeld = proj_poly.copy()
+        gekoppeld['addr:street'] = None
+        gekoppeld['addr:housenumber'] = None
 
-    df_addr_records.append({
-        'orig_index': orig_index,
-        'addr:street': primair_straat,
-        'addr:housenumber': geformatteerde_nummers,
-    })
-
-  if df_addr_records:
-    df_addr_agg = pd.DataFrame(df_addr_records).set_index('orig_index')
-    gekoppeld = proj_poly.join(df_addr_agg, on='orig_index')
-  else:
-    gekoppeld = proj_poly.copy()
-    gekoppeld['addr:street'] = None
-    gekoppeld['addr:housenumber'] = None
-
-  return gekoppeld, extra_address_nodes
+    return gekoppeld, extra_address_nodes
 
 
 def verwerk_gba_attributen(props):
-  new_props = {}
-  props_lower = {
-      str(k).lower(): v for k, v in props.items() if k is not None
-  }
-  gba_type = props_lower.get('type')
+    new_props = {}
+    props_lower = {
+        str(k).lower(): v for k, v in props.items() if k is not None
+    }
+    gba_type = props_lower.get('type')
 
-  try:
-    gba_type_int = int(gba_type) if gba_type is not None else None
-  except (ValueError, TypeError):
-    gba_type_int = None
+    try:
+        gba_type_int = int(gba_type) if gba_type is not None else None
+    except (ValueError, TypeError):
+        gba_type_int = None
 
-  if gba_type_int == 2:
-    new_props['building'] = 'roof'
-  elif gba_type_int == 3:
-    new_props['building:part'] = 'corridor'
-    new_props['building:min_level'] = '1'
-    new_props['building:levels'] = '2'
-  elif gba_type_int == 1:
-    new_props['building:part'] = 'yes'
-    new_props['building:min_level'] = '1'
-    new_props['building:levels'] = '2'
-  elif gba_type_int == 4:
-    new_props['building:part'] = 'steps'
-  else:
-    new_props['building:part'] = 'yes'
+    if gba_type_int == 2:
+        new_props['building'] = 'roof'
+    elif gba_type_int == 3:
+        new_props['building:part'] = 'corridor'
+        new_props['building:min_level'] = '1'
+        new_props['building:levels'] = '2'
+    elif gba_type_int == 1:
+        new_props['building:part'] = 'yes'
+        new_props['building:min_level'] = '1'
+        new_props['building:levels'] = '2'
+    elif gba_type_int == 4:
+        new_props['building:part'] = 'steps'
+    else:
+        new_props['building:part'] = 'yes'
 
-  return new_props
+    return new_props
 
 
 def verwerk_knw_attributen(props):
@@ -1016,7 +1007,6 @@ def verwerk_knw_attributen(props):
 
 
 def laad_en_prepareer_data(args, bbox, config):
-    """Haalt alle WFS data op, filtert, koppelt adressen en voegt GBG en GBA samen."""
     print(f"Bounding box uitlezen uit {args.osm_bestand}...")
 
     gdf_poly = haal_wfs_data_op("GRB:GBG", bbox)
@@ -1034,9 +1024,14 @@ def laad_en_prepareer_data(args, bbox, config):
 
     print(f"Succesvol {len(gdf_poly)} gebouwen, {len(gdf_gba)} bijgebouwen, {len(gdf_addr)} adrespunten en {len(gdf_wsm)} wegsegmenten opgehaald via WFS.")
 
-    for gdf, name in [(gdf_addr, 'addr'), (gdf_wsm, 'wsm'), (gdf_gba, 'gba')]:
-        if gdf_poly.crs != gdf.crs:
-            globals()[f'gdf_{name}'] = gdf.to_crs(gdf_poly.crs)
+    if not gdf_addr.empty and gdf_poly.crs != gdf_addr.crs:
+        gdf_addr = gdf_addr.to_crs(gdf_poly.crs)
+    if not gdf_wsm.empty and gdf_poly.crs != gdf_wsm.crs:
+        gdf_wsm = gdf_wsm.to_crs(gdf_poly.crs)
+    if not gdf_gba.empty and gdf_poly.crs != gdf_gba.crs:
+        gdf_gba = gdf_gba.to_crs(gdf_poly.crs)
+    if not gdf_knw.empty and gdf_poly.crs != gdf_knw.crs:
+        gdf_knw = gdf_knw.to_crs(gdf_poly.crs)
 
     mapping_columns = {}
     for col in ["HUISNR", "huisnummer", "Huisnummer"]:
@@ -1051,10 +1046,21 @@ def laad_en_prepareer_data(args, bbox, config):
 
     existing_osm_addresses = get_existing_osm_addresses_in_lambert2008(args.osm_bestand)
 
-    print("Bezig met slim koppelen en sorteren van adressen aan GBG gebouwen...")
+    # 1. Schoon de indexen op om conflicten bij de join te vermijden
+    gdf_poly = gdf_poly.reset_index(drop=True)
+    if not gdf_knw.empty:
+        gdf_knw = gdf_knw.reset_index(drop=True)
+
+    # 2. Voeg GBG en KNW samen VÓÓR de adreskoppeling zodat KNW ook adressen ontvangt
+    te_koppelen_objecten = gdf_poly.copy()
+    if not gdf_knw.empty:
+        te_koppelen_objecten = pd.concat([te_koppelen_objecten, gdf_knw], ignore_index=True)
+
+    print("Bezig met slim koppelen en sorteren van adressen aan GBG en KNW gebouwen...")
     import_losse_knopen = config.get('addressing', {}).get('import_loose_address_nodes', False)
+
     gekoppeld, extra_address_nodes = koppel_adressen_aan_gbg(
-        gdf_poly=gdf_poly,
+        gdf_poly=te_koppelen_objecten,
         sub_addr=sub_addr,
         gdf_wsm=gdf_wsm,
         existing_osm_addresses=existing_osm_addresses,
@@ -1078,17 +1084,10 @@ def laad_en_prepareer_data(args, bbox, config):
         gdf_knw = gdf_knw[~gdf_knw['TYPE'].isin(uitsluitingen)]
         print(f"KNW gefilterd: {len(gdf_knw)} over ({aantal_voor - len(gdf_knw)} technische/waterbouwkundige objecten verwijderd).")
 
+    # 3. Voeg uitsluitend GBA toe (zonder adreskoppeling)
+    # KNW zit immers al in 'gekoppeld' via 'te_koppelen_objecten'
     if not gdf_gba.empty:
-        for col in ['addr:street', 'addr:housenumber']:
-            if col not in gdf_gba.columns:
-                gdf_gba[col] = None
         gekoppeld = pd.concat([gekoppeld, gdf_gba], ignore_index=True)
-
-    if not gdf_knw.empty:
-        for col in ['addr:street', 'addr:housenumber']:
-            if col not in gdf_knw.columns:
-                gdf_knw[col] = None
-        gekoppeld = pd.concat([gekoppeld, gdf_knw], ignore_index=True)
 
     gekoppeld['wkt'] = gekoppeld['geometry'].apply(lambda g: g.wkt if g else "")
     gekoppeld = gekoppeld.drop_duplicates(subset=['wkt'], keep='first').drop(columns=['wkt'])
@@ -1103,7 +1102,6 @@ def laad_en_prepareer_data(args, bbox, config):
 
     existing_osm_polys = get_existing_osm_polys_met_meta(args.osm_bestand)
 
-    # Filtering toepassen op basis van CLI vlag OF configuratiebestand
     filtering_actief = config.get('filtering', {}).get('active', True) and not args.fno
     drempelwaarde = config.get('filtering', {}).get('overlap_threshold', 0.95)
 
@@ -1117,7 +1115,6 @@ def laad_en_prepareer_data(args, bbox, config):
 
 
 def verwerk_topologie_en_simplificatie(gekoppeld, originele_bbox_wgs84, config):
-    """Bouwt het TopoJSON netwerk op en vereenvoudigt de geometrieën netjes."""
     gekoppeld.to_crs("EPSG:4326").to_file("debug_1_ruwe_polygonen.geojson", driver="GeoJSON")
     print("--> Dump 1 opgeslagen: debug_1_ruwe_polygonen.geojson")
 
@@ -1176,14 +1173,13 @@ def main():
     parser = argparse.ArgumentParser(description="Leest een JOSM .osm-bestand en haalt GRB-gebouwen op.")
     parser.add_argument("osm_bestand", help="Pad naar het JOSM .osm-bestand")
     parser.add_argument("-fno", action='store_true', help="Schakel filtering uit (overrules config).")
-    parser.add_argument("--config", default="config.yaml", help="Pad naar het YAML-configuratiebestand.")
+    parser.add_argument("--config", default="tuning.yaml", help="Pad naar het YAML-configuratiebestand.")
     args = parser.parse_args()
 
     if not os.path.exists(args.osm_bestand):
         print(f"Fout: Het bestand '{args.osm_bestand}' is niet gevonden.", file=sys.stderr)
         sys.exit(1)
 
-    # 0. Configuratie inladen
     config = laad_configuratie(args.config)
 
     try:
@@ -1206,20 +1202,15 @@ def main():
         print(e, file=sys.stderr)
         sys.exit(1)
 
-    # 1. Data inladen en voorbereiden
     gekoppeld, extra_address_nodes, existing_osm_polys, gdf_poly = laad_en_prepareer_data(args, bbox_3812, config)
-
-    # 2. Topologie en simplificatie
     gdf_simplified = verwerk_topologie_en_simplificatie(gekoppeld, originele_bbox_wgs84, config)
 
-    # 3. Zoekstring genereren
     exporteer_verouderde_osm_zoekstring(
         osm_polys_met_meta=existing_osm_polys,
         gdf_grb=gdf_poly,
         output_path="to_check.txt"
     )
 
-    # 4. Tags toevoegen en GeoJSON wegschrijven
     print("Stap 2/2: Verwerken van tags, adrescorrecties en GeoJSON export...")
     features_out = []
 
@@ -1249,11 +1240,6 @@ def main():
         if existing_farmyards:
             in_farmyard = any(fy.intersects(geom_obj) for fy in existing_farmyards)
 
-        if in_farmyard:
-            building_val = 'farm' if heeft_adres else 'farm_auxiliary'
-        else:
-            building_val = 'house' if heeft_adres else 'yes'
-
         new_props = {}
 
         if grb_laag == 'GBA' or prefix == 'Gba':
@@ -1261,6 +1247,10 @@ def main():
 
         elif grb_laag == 'KNW' or prefix == 'Knw':
             new_props = verwerk_knw_attributen(props)
+            for osm_tag in ["addr:street", "addr:housenumber", "fixme"]:
+                val = props.get(osm_tag)
+                if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
+                    new_props[osm_tag] = str(val)
 
         else:
             if in_farmyard:
@@ -1269,53 +1259,15 @@ def main():
                 building_val = 'house' if heeft_adres else 'yes'
             new_props['building'] = building_val
 
-        if date_val:
-            new_props['source:geometry:date'] = date_val
-        if ref_val:
-            new_props['source:geometry:ref'] = ref_val
-
-        straten_raw = props.get('addr:street_list', [])
-        huisnummers_raw = props.get('addr:housenumber_list', [])
-
-        is_complex_blok = False
-
-        if isinstance(straten_raw, list) and len(set(straten_raw)) > 1:
-            is_complex_blok = True
-        elif isinstance(huisnummers_raw, list) and len(huisnummers_raw) > 1:
-            try:
-                nummers_int = []
-                for h in huisnummers_raw:
-                    match = re.search(r'\d+', str(h))
-                    if match:
-                        nummers_int.append(int(match.group()))
-
-                if nummers_int and len(nummers_int) == len(huisnummers_raw):
-                    nummers_int.sort()
-                    verschillen = [nummers_int[i+1] - nummers_int[i] for i in range(len(nummers_int)-1)]
-                    max_verschil = max(verschillen) if verschillen else 0
-
-                    if max_verschil > 2:
-                        is_complex_blok = True
-                else:
-                    is_complex_blok = True
-            except Exception:
-                is_complex_blok = True
-
-        if is_complex_blok:
-            for s_val, h_val in zip(straten_raw, huisnummers_raw):
-                punt_geom = props.get('original_address_point')
-                if punt_geom:
-                    extra_address_nodes.append({
-                        'geometry': punt_geom,
-                        'addr:street': s_val,
-                        'addr:housenumber': h_val,
-                        'fixme': 'Niet-opeenvolgende of complexe adressering: omgezet naar los adrespunt.'
-                    })
-        else:
             for osm_tag in ["addr:street", "addr:housenumber", "fixme"]:
                 val = props.get(osm_tag)
                 if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
                     new_props[osm_tag] = str(val)
+
+        if date_val:
+            new_props['source:geometry:date'] = date_val
+        if ref_val:
+            new_props['source:geometry:ref'] = ref_val
 
         features_out.append({
             "type": "Feature",
@@ -1369,7 +1321,7 @@ def main():
         params = {"filename": abs_output_path}
         full_url = f"{josm_url}?{urllib.parse.urlencode(params)}"
 
-        with urllib.request.urlopen(full_url) as response:
+        with urllib.request.urlopen(full_url, timeout=3.0) as response:
             if response.status == 200:
                 print("Succes! Het bestand is geopend in JOSM.")
             else:
