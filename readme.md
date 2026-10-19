@@ -23,7 +23,7 @@ Het script haalt gebouwen en adressen rechtstreeks op via WFS in het **Lambert 2
 Zorg dat de benodigde Python-pakketten geïnstalleerd zijn:
 
 ```
-pip install geopandas shapely topojson pyyaml requests pandas
+pip install geopandas shapely topojson pyyaml requests pandas pyproj
 
 ```
 
