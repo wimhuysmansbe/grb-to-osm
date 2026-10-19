@@ -426,7 +426,7 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
     proj_poly['orig_index'] = proj_poly.index
     proj_poly['poly_area'] = proj_poly.geometry.area  # Voor snelle tie-breaking
 
-    # --- OPTIMALISATIE 1: BBOX Filtering vóór de join ---
+    # --- BBOX Filtering ---
     poly_bbox = box(*proj_poly.total_bounds)
     proj_addr = sub_addr[sub_addr.geometry.intersects(poly_bbox)].copy()
 
@@ -434,84 +434,109 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         gekoppeld = proj_poly.copy()
         gekoppeld['addr:street'] = None
         gekoppeld['addr:housenumber'] = None
-        return gekoppeld, extra_address_nodes.drop(columns=['poly_area'], errors='ignore')
+        return gekoppeld.drop(columns=['poly_area'], errors='ignore'), extra_address_nodes
 
-    # 1. Snelle directe ruimtelijke join (Exacte overlap)
+    # -------------------------------------------------------------------------
+    # STAP 1: Directe insluiting (intersects)
+    # -------------------------------------------------------------------------
     intersect_join = gpd.sjoin(proj_addr, proj_poly, how='inner', predicate='intersects')
 
     if not intersect_join.empty:
-        # VANG DE GRENS-EDGECASE OP:
-        # Als 1 adrespunt exact op de grens van 2 of 3 gebouwen ligt,
-        # kies alleen het DICHTSTBIJZIJNDE en GROOTSTE gebouw!
         intersect_join['poly_area_val'] = proj_poly.loc[intersect_join['orig_index'], 'poly_area'].values
-
-        # Sorteer per adrespunt (index) op gebouwoppervlakte (grootste eerst)
         intersect_join = intersect_join.sort_values(by='poly_area_val', ascending=False)
         intersect_join = intersect_join[~intersect_join.index.duplicated(keep='first')].copy()
         intersect_join = intersect_join.drop(columns=['poly_area_val'], errors='ignore')
 
-    matched_addr_indices = set(intersect_join.index) if not intersect_join.empty else set()
-    unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_indices)].copy()
+    matched_addr_ids = set(intersect_join.index) if not intersect_join.empty else set()
+    matched_poly_ids = set(intersect_join['orig_index']) if not intersect_join.empty else set()
 
-    # 2. Snelle nabijheidskoppeling (Strikte 1-op-1 koppeling)
+    # -------------------------------------------------------------------------
+    # STAP 2: Gaten & Patio's dichten met vul_gaten_van_polygoon
+    # (Voor adrespunten in binnenpleinen zoals in Malle)
+    # -------------------------------------------------------------------------
+    unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
+    lege_gebouwen = proj_poly.loc[~proj_poly['orig_index'].isin(matched_poly_ids)].copy()
+
+    hole_join = None
+    if not unmatched_addr.empty and not lege_gebouwen.empty:
+        dichte_gebouwen = lege_gebouwen.copy()
+        dichte_gebouwen['geometry'] = dichte_gebouwen['geometry'].apply(vul_gaten_van_polygoon)
+
+        hole_join = gpd.sjoin(unmatched_addr, dichte_gebouwen, how='inner', predicate='intersects')
+
+        if not hole_join.empty:
+            hole_join['poly_area_val'] = proj_poly.loc[hole_join['orig_index'], 'poly_area'].values
+            hole_join = hole_join.sort_values(by='poly_area_val', ascending=False)
+            hole_join = hole_join[~hole_join.index.duplicated(keep='first')].copy()
+            hole_join = hole_join.drop(columns=['poly_area_val'], errors='ignore')
+
+            matched_addr_ids.update(hole_join.index)
+            matched_poly_ids.update(hole_join['orig_index'])
+
+    # -------------------------------------------------------------------------
+    # STAP 3: Omgekeerde nabijheid (4m buffer om losse adrespunten)
+    # -------------------------------------------------------------------------
+    unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
+
     nearest_join = None
     if not unmatched_addr.empty and not proj_poly.empty:
-        sjoined_nearest = gpd.sjoin_nearest(
-            unmatched_addr,
-            proj_poly,
-            how='inner',
-            max_distance=4.0,
-            distance_col='dist_to_poly'
-        )
+        # 1. Maak een tijdelijke 4m buffer om enkel de losse adrespunten
+        buffered_addr = unmatched_addr.copy()
+        buffered_addr['geometry'] = buffered_addr.geometry.buffer(4.0)
 
-        if not sjoined_nearest.empty:
-            # Voeg oppervlakte veilig toe via de orig_index mapping
-            sjoined_nearest['poly_area_val'] = proj_poly.loc[sjoined_nearest['orig_index'], 'poly_area'].values
+        # 2. Snelle gevectoriseerde sjoin (GeoPandas gebruikt automatisch z'n interne C-index)
+        matches = gpd.sjoin(buffered_addr, proj_poly, how='inner', predicate='intersects')
 
-            sjoined_nearest = sjoined_nearest.sort_values(
+        if not matches.empty:
+            # 3. Bereken afstand veilig per match-rij (voorkomt lengte-mismatches en UserWarning)
+            left_geoms = unmatched_addr.loc[matches.index, 'geometry'].to_numpy()
+            right_geoms = proj_poly.loc[matches['orig_index'], 'geometry'].to_numpy()
+
+            matches['dist_to_poly'] = gpd.GeoSeries(left_geoms).distance(gpd.GeoSeries(right_geoms)).to_numpy()
+            matches['poly_area_val'] = proj_poly.loc[matches['orig_index'], 'poly_area'].values
+
+            # 4. Sorteer op kortste afstand, daarna op grootste gebouwoppervlakte
+            matches = matches.sort_values(
                 by=['dist_to_poly', 'poly_area_val'],
                 ascending=[True, False]
             )
-            # Maximaal 1 gebouw per adrespunt
-            nearest_join = sjoined_nearest[~sjoined_nearest.index.duplicated(keep='first')].copy()
-            nearest_join = nearest_join.drop(columns=['dist_to_poly', 'poly_area_val'], errors='ignore')
 
-            matched_addr_indices.update(nearest_join.index)
+            # 5. Bewaar per adrespunt-index maximaal 1 dichtstbijzijnde gebouw match
+            nearest_join = matches[~matches.index.duplicated(keep='first')].copy()
 
-    # 3. Solide gaten vullen via sindex-kandidaten
+            # Herstel de originele puntgeometrie
+            nearest_join['geometry'] = unmatched_addr.loc[nearest_join.index, 'geometry']
+            nearest_join = nearest_join.drop(columns=['dist_to_poly', 'poly_area_val', 'index_right'], errors='ignore')
+
+            matched_addr_ids.update(nearest_join.index)
+            matched_poly_ids.update(nearest_join['orig_index'])
+
+    # -------------------------------------------------------------------------
+    # STAP 4: Convex Hull via veilige_convex_hull_per_part
+    # (Laatste vangnet voor vreemd gevormde gebouwen)
+    # -------------------------------------------------------------------------
+    unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
+    lege_gebouwen = proj_poly.loc[~proj_poly['orig_index'].isin(matched_poly_ids)].copy()
+
     hull_join = None
-    still_unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_indices)].copy()
+    if not unmatched_addr.empty and not lege_gebouwen.empty:
+        hull_gebouwen = lege_gebouwen.copy()
+        hull_gebouwen['geometry'] = hull_gebouwen['geometry'].apply(veilige_convex_hull_per_part)
 
-    if not still_unmatched_addr.empty and not proj_poly.empty:
-        gekoppelde_gebouw_indices = set()
-        if not intersect_join.empty:
-            gekoppelde_gebouw_indices.update(intersect_join['orig_index'])
-        if nearest_join is not None and not nearest_join.empty:
-            gekoppelde_gebouw_indices.update(nearest_join['orig_index'])
+        hull_join = gpd.sjoin(unmatched_addr, hull_gebouwen, how='inner', predicate='intersects')
 
-        lege_gebouwen = proj_poly.loc[~proj_poly['orig_index'].isin(gekoppelde_gebouw_indices)].copy()
+        if not hull_join.empty:
+            hull_join['poly_area_val'] = proj_poly.loc[hull_join['orig_index'], 'poly_area'].values
+            hull_join = hull_join.sort_values(by='poly_area_val', ascending=False)
+            hull_join = hull_join[~hull_join.index.duplicated(keep='first')].copy()
+            hull_join = hull_join.drop(columns=['poly_area_val'], errors='ignore')
 
-        if not lege_gebouwen.empty:
-            sindex_poly = lege_gebouwen.sindex
-            candidate_poly_indices = set()
-            for pt in still_unmatched_addr.geometry:
-                if pt and not pt.is_empty:
-                    candidate_poly_indices.update(sindex_poly.query(pt.buffer(5.0), predicate="intersects"))
+            matched_addr_ids.update(hull_join.index)
 
-            if candidate_poly_indices:
-                relevante_gebouwen = lege_gebouwen.iloc[list(candidate_poly_indices)].copy()
-                relevante_gebouwen['geometry'] = relevante_gebouwen['geometry'].apply(vul_gaten_van_polygoon)
-                hull_join = gpd.sjoin(still_unmatched_addr, relevante_gebouwen, how='inner', predicate='intersects')
-
-                if not hull_join.empty:
-                    hull_join['poly_area_val'] = proj_poly.loc[hull_join['orig_index'], 'poly_area'].values
-                    hull_join = hull_join.sort_values(by='poly_area_val', ascending=False)
-                    hull_join = hull_join[~hull_join.index.duplicated(keep='first')].copy()
-                    hull_join = hull_join.drop(columns=['poly_area_val'], errors='ignore')
-                    matched_addr_indices.update(hull_join.index)
-
-    # 4. Losse adrespunten opvangen
-    still_unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_indices)].copy()
+    # -------------------------------------------------------------------------
+    # SAMENVOEGEN & AGGREGATIE
+    # -------------------------------------------------------------------------
+    still_unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
     if import_loose_address_nodes and not still_unmatched_addr.empty:
         for _, row_unmatched in still_unmatched_addr.iterrows():
             extra_address_nodes.append({
@@ -521,8 +546,7 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
                 'fixme': 'Niet gekoppeld aan gebouw: behouden als los adrespunt.',
             })
 
-    # 5. Gecombineerde resultaten verwerken
-    all_matches = [m for m in [intersect_join, nearest_join, hull_join] if m is not None and not m.empty]
+    all_matches = [m for m in [intersect_join, hole_join, nearest_join, hull_join] if m is not None and not m.empty]
     combined_join = pd.concat(all_matches, ignore_index=True) if all_matches else gpd.GeoDataFrame()
 
     if combined_join.empty or 'orig_index' not in combined_join.columns:
@@ -531,7 +555,7 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         gekoppeld['addr:housenumber'] = None
         return gekoppeld.drop(columns=['poly_area'], errors='ignore'), extra_address_nodes
 
-    # --- Gevectoriseerde Adres-aggregatie ---
+    # Adres-aggregatie per gebouw
     combined_join['addr:street'] = combined_join['addr:street'].astype(str).str.strip()
     combined_join['addr:housenumber'] = combined_join['addr:housenumber'].astype(str).str.strip()
 
@@ -547,13 +571,11 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         gekoppeld['addr:housenumber'] = None
         return gekoppeld.drop(columns=['poly_area'], errors='ignore'), extra_address_nodes
 
-    # Meest frequente straat per gebouw bepalen
     street_counts = filtered_join.groupby(['orig_index', 'addr:street']).size().reset_index(name='count')
     primary_streets = street_counts.sort_values(['orig_index', 'count'], ascending=[True, False]).drop_duplicates('orig_index')
 
     primary_join = filtered_join.merge(primary_streets[['orig_index', 'addr:street']], on=['orig_index', 'addr:street'])
 
-    # Unieke huisnummers aggergeren per gebouw
     df_addr_agg = (
         primary_join.groupby(['orig_index', 'addr:street'])['addr:housenumber']
         .unique()
@@ -564,14 +586,13 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
 
     gekoppeld = proj_poly.join(df_addr_agg[['addr:street', 'addr:housenumber']], on='orig_index')
 
-    # --- TIE-BREAKER: OVERLAPPENDE REEKSEN ONTWARREN (bijv. 5;7 en 7;9) ---
+    # --- TIE-BREAKER VOOR DUBBELE REEKSEN ---
     if gdf_wsm is not None and not gdf_wsm.empty:
         wgm_union = gdf_wsm.geometry.union_all()
         gekoppeld['dist_to_street'] = gekoppeld.geometry.distance(wgm_union)
     else:
         gekoppeld['dist_to_street'] = 0.0
 
-    # Sorteer gebouwen op kwaliteit (grootste oppervlakte, dichtst bij straat)
     gekoppeld = gekoppeld.sort_values(
         by=['poly_area', 'dist_to_street'],
         ascending=[False, True]
@@ -583,14 +604,11 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         met_adres = gekoppeld[has_addr].copy()
         zonder_adres = gekoppeld[~has_addr].copy()
 
-        # Explodeer reeksen (bijv. "5;7" -> "5", "7") om overlap per uniek nummer te detecteren
         met_adres['single_nr'] = met_adres['addr:housenumber'].astype(str).str.split(';')
         exploded = met_adres.explode('single_nr')
 
-        # Drop dubbelen op het niveau van het unieke nummer: het BESTE gebouw wint!
         exploded_unique = exploded.drop_duplicates(subset=['addr:street', 'single_nr'], keep='first')
 
-        # Hergroepeer de overgebleven nummers per gebouw
         recombined = (
             exploded_unique.groupby(exploded_unique.index)
             .agg({'single_nr': lambda x: ';'.join(sorted(set(x), key=lambda n: (len(n), n)))})
@@ -599,11 +617,11 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         met_adres['addr:housenumber'] = recombined['single_nr']
         gekoppeld = pd.concat([met_adres, zonder_adres], ignore_index=False)
 
-    # Opruimen van hulpkolommen en herstellen van sorteervolgorde
     gekoppeld = gekoppeld.drop(columns=['poly_area', 'dist_to_street', 'single_nr'], errors='ignore')
     gekoppeld = gekoppeld.sort_index()
 
     return gekoppeld, extra_address_nodes
+
 def filter_existing_gdf(gdf_grb, osm_polys_met_meta, threshold=0.95):
     if not osm_polys_met_meta or gdf_grb.empty:
         return gdf_grb
