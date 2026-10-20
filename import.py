@@ -144,7 +144,18 @@ class OsmContext:
             node_tags = {}
             for node in root.findall('node'):
                 nid = node.get('id')
-                lat, lon = float(node.get('lat')), float(node.get('lon'))
+                lat_str = node.get('lat')
+                lon_str = node.get('lon')
+
+                # Sla nodes over als coördinaten ontbreken
+                if lat_str is None or lon_str is None:
+                    continue
+
+                try:
+                    lat, lon = float(lat_str), float(lon_str)
+                except ValueError:
+                    continue  # Sla nodes over met ongeldige numerieke waarden
+
                 nodes[nid] = (lon, lat)
                 tags = {t.get('k'): t.get('v') for t in node.findall('tag')}
                 if tags:
