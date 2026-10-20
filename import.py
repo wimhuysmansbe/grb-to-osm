@@ -1,6 +1,7 @@
 import argparse
-import sys
 import os
+import sys
+import time
 import json
 import xml.etree.ElementTree as ET
 import urllib.parse
@@ -41,6 +42,9 @@ def laad_configuratie(config_pad="tuning.yaml"):
         'topology': {
             'tolerance_meters': 0.05,
             'gewenste_stap_meter': 0.01
+        },
+        'performance': {
+            'show_timers': True  # Zet dit op False in tuning.yaml om alle timers uit te schakelen
         }
     }
 
@@ -62,6 +66,11 @@ def laad_configuratie(config_pad="tuning.yaml"):
         print(f"Geen '{config_pad}' gevonden. Standaardwaarden worden gebruikt.")
 
     return standaard_config
+
+def log_timer(config, bericht):
+    """Print alleen als timers ingeschakeld zijn in de configuratie."""
+    if config.get('performance', {}).get('show_timers', True):
+        print(bericht)
 
 def test_snap_naar_buren(gdf, snap_tolerance=0.01):
     """
@@ -375,11 +384,17 @@ def filter_existing_gdf(gdf_grb, osm_polys_met_meta, threshold=0.95):
 
 
 def verwerk_topologie_en_simplificatie(gekoppeld, bbox_wgs84, config):
+    t_start = time.perf_counter()
+    t_stap = t_start
+
     if gekoppeld.empty:
         return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
 
     gekoppeld = gekoppeld.copy()
-    gekoppeld['geometry'] = gekoppeld['geometry'].apply(lambda geom: set_precision(geom, grid_size=0.001))
+    gekoppeld['geometry'] = set_precision(gekoppeld.geometry.values, grid_size=0.001)
+
+    log_timer(config, f"      - Topo | set_precision: {time.perf_counter() - t_stap:.2f}s")
+    t_stap = time.perf_counter()
 
     TOLERANCE_METERS = config.get('topology', {}).get('tolerance_meters', 0.05)
     GEWENSTE_STAP_METER = config.get('topology', {}).get('gewenste_stap_meter', 0.01)
@@ -389,17 +404,32 @@ def verwerk_topologie_en_simplificatie(gekoppeld, bbox_wgs84, config):
     quant = int(langste_zijde / GEWENSTE_STAP_METER) if langste_zijde > 0 else 1000
 
     topo = tp.Topology(gekoppeld, prequantize=quant).toposimplify(TOLERANCE_METERS).to_gdf()
+
+    log_timer(config,f"      - Topo | tp.Topology & toposimplify: {time.perf_counter() - t_stap:.2f}s")
+    t_stap = time.perf_counter()
+
     topo.index = gekoppeld.index
     topo['geometry'] = topo['geometry'].buffer(0)
-    topo = test_snap_naar_buren(topo, snap_tolerance=0.02)
+    topo = test_snap_naar_buren(topo, snap_tolerance=0.1)
+
+    log_timer(config, f"      - Topo | buffer & snap_naar_buren: {time.perf_counter() - t_stap:.2f}s")
+    t_stap = time.perf_counter()
 
     gdf_simplified = topo.to_crs("EPSG:4326")
     box_wgs84 = box(*bbox_wgs84)
-    return gdf_simplified[gdf_simplified.geometry.intersects(box_wgs84)].copy()
+    result = gdf_simplified[gdf_simplified.geometry.intersects(box_wgs84)].copy()
+
+    log_timer(config, f"      - Topo | reprojection & bbox filter: {time.perf_counter() - t_stap:.2f}s")
+    log_timer(config, f"    -> Totaal Topologie & simplificatie duur: {time.perf_counter() - t_start:.2f}s")
+
+    return result
 
 
 def verwerk_grb_data(grb_lagen, osm_ctx, config, args):
     """Combineert filtering, adreskoppeling en simplificatie."""
+    t_start = time.perf_counter()
+    t_stap = t_start
+
     gdf_poly = grb_lagen['gbg'].reset_index(drop=True)
     gdf_gba = grb_lagen['gba']
     gdf_knw = grb_lagen['knw'].reset_index(drop=True) if not grb_lagen['knw'].empty else grb_lagen['knw']
@@ -431,6 +461,9 @@ def verwerk_grb_data(grb_lagen, osm_ctx, config, args):
     # Voeg GBG en KNW samen VOOR de adreskoppeling (KNW kan adressen hebben)
     te_koppelen_objecten = pd.concat([gdf_poly, gdf_knw], ignore_index=True) if not gdf_knw.empty else gdf_poly
 
+    log_timer(config, f"    - Voorbereiding & filtering data: {time.perf_counter() - t_stap:.1f}s")
+    t_stap = time.perf_counter()
+
     import_losse_knopen = config.get('addressing', {}).get('import_loose_address_nodes', False)
     gekoppeld, extra_address_nodes = koppel_adressen(
         gdf_poly=te_koppelen_objecten,
@@ -444,22 +477,33 @@ def verwerk_grb_data(grb_lagen, osm_ctx, config, args):
     if not gdf_gba.empty:
         gekoppeld = pd.concat([gekoppeld, gdf_gba], ignore_index=True)
 
+    log_timer(config, f"    - Adrestoekenning (`koppel_adressen`): {time.perf_counter() - t_stap:.1f}s")
+    t_stap = time.perf_counter()
+
     gekoppeld['wkt'] = gekoppeld['geometry'].apply(lambda g: g.wkt if g else "")
     gekoppeld = gekoppeld.drop_duplicates(subset=['wkt'], keep='first').drop(columns=['wkt'])
     gekoppeld['geometry'] = gekoppeld['geometry'].buffer(0)
     gekoppeld = gekoppeld.explode(index_parts=False).reset_index(drop=True)
     gekoppeld = gekoppeld[gekoppeld.geometry.area >= 1.0]
 
+    log_timer(config, f"    - Geometrie opschonen & ontdubbelen: {time.perf_counter() - t_stap:.1f}s")
+    t_stap = time.perf_counter()
+
     # Filtering tegen bestaande OSM gebouwen
     filtering_actief = config.get('filtering', {}).get('active', True) and not args.fno
     if filtering_actief:
         gekoppeld = filter_existing_gdf(gekoppeld, osm_ctx.existing_polys_3812, threshold=config.get('filtering', {}).get('overlap_threshold', 0.95))
 
+    log_timer(config, f"    - Filtering tegen bestaande OSM: {time.perf_counter() - t_stap:.1f}s")
+    t_stap = time.perf_counter()
+
     # Topologie en vereenvoudiging
     gdf_simplified = verwerk_topologie_en_simplificatie(gekoppeld, osm_ctx.bbox_wgs84, config)
 
-    return gdf_simplified, extra_address_nodes
+    log_timer(config, f"    - Topologie & simplificatie: {time.perf_counter() - t_stap:.1f}s")
+    log_timer(config, f"  -> Totaal Transform duur: {time.perf_counter() - t_start:.1f}s")
 
+    return gdf_simplified, extra_address_nodes
 
 # ==============================================================================
 # 4. TAGGING & MAPPING (GBG / GBA / KNW)
@@ -558,7 +602,10 @@ def ken_osm_tags_toe(gdf_simplified, osm_ctx):
 # 5. EXPORT & JOSM INTEGRATIE
 # ==============================================================================
 
-def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path="to_check.txt", max_overlap_ratio=0.10, min_leeftijd_jaar=3):
+def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path="to_check.txt", max_overlap_ratio=0.10, min_leeftijd_jaar=3, config=None):
+    t_start = time.perf_counter()
+    t_stap = t_start
+
     if not osm_polys_met_meta or gdf_grb.empty:
         return
 
@@ -578,13 +625,10 @@ def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path
     if gdf_grb.crs != "EPSG:3812":
         gdf_grb = gdf_grb.to_crs("EPSG:3812")
 
-    grb_union = unary_union([g for g in gdf_grb.geometry if g and not g.is_empty])
     osm_gdf['area'] = osm_gdf.geometry.area
     osm_gdf = osm_gdf[osm_gdf['area'] > 0].copy()
 
-    intersections = osm_gdf.geometry.intersection(grb_union)
-    osm_gdf['overlap_ratio'] = intersections.area / osm_gdf['area']
-
+    # --- 1. FILTER DIRECT OP LEEFTIJD (vóór de dure sindex check) ---
     huidige_tijd = pd.Timestamp.now()
     leeftijd_grens_dagen = min_leeftijd_jaar * 365.25
 
@@ -594,7 +638,40 @@ def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path
         if pd.isna(ts): return True
         return (huidige_tijd - (ts.tz_localize(None) if ts.tzinfo else ts)).days >= leeftijd_grens_dagen
 
-    wees_panden = osm_gdf[(osm_gdf['overlap_ratio'] < max_overlap_ratio) & osm_gdf['timestamp'].apply(is_oud_genoeg)]
+    osm_gdf['is_oud'] = osm_gdf['timestamp'].apply(is_oud_genoeg)
+
+    # We behouden enkel de oude panden voor de sindex check; jonge panden krijgen direct overlap_ratio = 1.0 (of worden overgeslagen)
+    # Alleen oude panden hoeven gecheckt te worden op overlap
+    oude_panden = osm_gdf[osm_gdf['is_oud']].copy()
+
+    log_timer(config, f"    - Export setup & leeftijd filtering ({len(oude_panden)} van {len(osm_gdf)} te controleren): {time.perf_counter() - t_stap:.1f}s")
+    t_stap = time.perf_counter()
+
+    # --- 2. SNELLE SINDEX LOOP ALLEEN VOOR OUDE PANDEN ---
+    sindex = gdf_grb.sindex
+    overlap_ratios = []
+
+    for idx, row in oude_panden.iterrows():
+        osm_geom = row.geometry
+        osm_area = row['area']
+
+        possible_matches_index = list(sindex.intersection(osm_geom.bounds))
+        possible_matches = gdf_grb.geometry.iloc[possible_matches_index]
+        intersecting_geoms = possible_matches[possible_matches.intersects(osm_geom)]
+
+        if not intersecting_geoms.empty:
+            overlap_area = intersecting_geoms.intersection(osm_geom).area.sum()
+            overlap_ratios.append(overlap_area / osm_area)
+        else:
+            overlap_ratios.append(0.0)
+
+    oude_panden['overlap_ratio'] = overlap_ratios
+
+    log_timer(config, f"    - Intersecties & overlap via sindex: {time.perf_counter() - t_stap:.1f}s")
+    t_stap = time.perf_counter()
+
+    # --- 3. FINALE SELECTIE & EXPORT ---
+    wees_panden = oude_panden[oude_panden['overlap_ratio'] < max_overlap_ratio]
     ids_schoon = list(dict.fromkeys(["".join(filter(str.isdigit, str(oid))) for oid in wees_panden['osm_id'].dropna() if str(oid)]))
 
     if ids_schoon:
@@ -602,6 +679,9 @@ def exporteer_verouderde_osm_zoekstring(osm_polys_met_meta, gdf_grb, output_path
         with open(output_path, "w") as f:
             f.write(zoek_string)
         print(f"JOSM-zoekstring voor {len(ids_schoon)} verouderde wees-panden opgeslagen in '{output_path}'.")
+
+    log_timer(config, f"    - Leeftijd filtering & export: {time.perf_counter() - t_stap:.1f}s")
+    log_timer(config, f"  -> Totaal Export duur: {time.perf_counter() - t_start:.1f}s")
 
 
 def exporteer_geojson(features_out, extra_address_nodes, osm_bestand):
@@ -647,6 +727,7 @@ def open_in_josm(output_filepath):
 # ==============================================================================
 
 def main():
+
     parser = argparse.ArgumentParser(description="Leest een JOSM .osm-bestand en haalt GRB-gebouwen op.")
     parser.add_argument("osm_bestand", help="Pad naar het JOSM .osm-bestand")
     parser.add_argument("-fno", action='store_true', help="Schakel filtering uit (overrules config).")
@@ -657,23 +738,46 @@ def main():
         print(f"Fout: Het bestand '{args.osm_bestand}' is niet gevonden.", file=sys.stderr)
         sys.exit(1)
 
+    t_start_totaal = time.perf_counter()
+    t_stap = t_start_totaal
+
+    print("=== Start import pipeline ===")
+
     # 1. EXTRACT
     config = laad_configuratie(args.config)
     osm_ctx = OsmContext(args.osm_bestand)
     grb_lagen = haal_alle_grb_lagen_op(osm_ctx.bbox_3812)
 
+    duur = time.perf_counter() - t_stap
+    log_timer(config, f"  -> 1. Extract (config, OSM context & GRB lagen ophalen) voltooid in {duur:.1f}s")
+    t_stap = time.perf_counter()
+
     # 2. TRANSFORM
     gdf_simplified, extra_address_nodes = verwerk_grb_data(grb_lagen, osm_ctx, config, args)
+
+    duur = time.perf_counter() - t_stap
+    log_timer(config, f"  -> 2. Transform (GRB data verwerking & filtering) voltooid in {duur:.1f}s")
+    t_stap = time.perf_counter()
 
     # 3. TAGGING
     features_out = ken_osm_tags_toe(gdf_simplified, osm_ctx)
 
+    duur = time.perf_counter() - t_stap
+    log_timer(config, f"  -> 3. Tagging voltooid in {duur:.1f}s")
+    t_stap = time.perf_counter()
+
     # 4. EXPORT
-    exporteer_verouderde_osm_zoekstring(osm_ctx.existing_polys_3812, grb_lagen['gbg'], output_path="to_check.txt")
+    exporteer_verouderde_osm_zoekstring(osm_ctx.existing_polys_3812, grb_lagen['gbg'], output_path="to_check.txt", config=config)
     output_filepath = exporteer_geojson(features_out, extra_address_nodes, args.osm_bestand)
+
+    duur = time.perf_counter() - t_stap
+    log_timer(config, f"  -> 4. Export (GeoJSON & checks) voltooid in {duur:.1f}s")
 
     print(f"\nSucces! Het bestand is gegenereerd op basis van de bounding box uit {args.osm_bestand}.")
     print(f"Klaar voor JOSM: {output_filepath}")
+
+    totaal_duur = time.perf_counter() - t_start_totaal
+    log_timer(config, f"\nSucces! Totale uitvoeringstijd: {totaal_duur:.1f}s")
 
     open_in_josm(output_filepath)
 

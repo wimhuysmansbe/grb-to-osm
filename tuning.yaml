@@ -23,3 +23,6 @@ topology:
   # ===================================================================
   tolerance_meters: 0.05
   gewenste_stap_meter: 0.01
+
+performance:
+  show_timers: false
