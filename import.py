@@ -396,21 +396,53 @@ def verwerk_topologie_en_simplificatie(gekoppeld, bbox_wgs84, config):
     log_timer(config, f"      - Topo | set_precision: {time.perf_counter() - t_stap:.2f}s")
     t_stap = time.perf_counter()
 
+    import math
+    from shapely.geometry import box
+
     TOLERANCE_METERS = config.get('topology', {}).get('tolerance_meters', 0.05)
     GEWENSTE_STAP_METER = config.get('topology', {}).get('gewenste_stap_meter', 0.01)
 
-    total_bounds = gekoppeld.total_bounds
-    langste_zijde = max(total_bounds[2] - total_bounds[0], total_bounds[3] - total_bounds[1])
+    # Globale referentiepunten voor het centimetergrid in EPSG:3812
+    OFFSET_X = 500000.0
+    OFFSET_Y = 5200000.0
+
+    # 1. Haal de lokale bounds van de tegel op
+    minx, miny, maxx, maxy = gekoppeld.total_bounds
+
+    # 2. Snap deze bounds exact naar het globale centimetergrid
+    minx_gesnapt = OFFSET_X + math.floor((minx - OFFSET_X) / GEWENSTE_STAP_METER) * GEWENSTE_STAP_METER
+    miny_gesnapt = OFFSET_Y + math.floor((miny - OFFSET_Y) / GEWENSTE_STAP_METER) * GEWENSTE_STAP_METER
+    maxx_gesnapt = OFFSET_X + math.ceil((maxx - OFFSET_X) / GEWENSTE_STAP_METER) * GEWENSTE_STAP_METER
+    maxy_gesnapt = OFFSET_Y + math.ceil((maxy - OFFSET_Y) / GEWENSTE_STAP_METER) * GEWENSTE_STAP_METER
+
+    # Maak de tegel-dummy absoluut vierkant voor een isotroop rooster
+    breedte = maxx_gesnapt - minx_gesnapt
+    hoogte = maxy_gesnapt - miny_gesnapt
+    langste_zijde = max(breedte, hoogte)
+
+    # Corrigeer max om het vierkant te maken op basis van de langste zijde
+    maxx_gesnapt = minx_gesnapt + langste_zijde
+    maxy_gesnapt = miny_gesnapt + langste_zijde
+
     quant = int(langste_zijde / GEWENSTE_STAP_METER) if langste_zijde > 0 else 1000
 
-    topo = tp.Topology(gekoppeld, prequantize=quant).toposimplify(TOLERANCE_METERS).to_gdf()
+    # 3. Bouw de gekombineerde dataset met deze lokale, gesnapte dummy-box
+    gekoppeld_met_dummy = gekoppeld.copy()
+    dummy_poly = box(minx_gesnapt, miny_gesnapt, maxx_gesnapt, maxy_gesnapt)
 
-    log_timer(config,f"      - Topo | tp.Topology & toposimplify: {time.perf_counter() - t_stap:.2f}s")
-    t_stap = time.perf_counter()
+    dummy_row = gpd.GeoDataFrame([{'geometry': dummy_poly, 'is_dummy': True}], crs=gekoppeld.crs)
+    gekoppeld_met_dummy['is_dummy'] = False
 
+    gekoppeld_gecombineerd = pd.concat([gekoppeld_met_dummy, dummy_row], ignore_index=True)
+
+    # 4. TopoJSON draait nu superstabiel op een lokaal bereik met een perfect passende quant
+    topo = tp.Topology(gekoppeld_gecombineerd, prequantize=quant).toposimplify(TOLERANCE_METERS).to_gdf()
+
+    # 5. Filter de dummy eruit en voer je veilige snap uit
+    topo = topo[topo['is_dummy'] != True].copy()
     topo.index = gekoppeld.index
     topo['geometry'] = topo['geometry'].buffer(0)
-    topo = test_snap_naar_buren(topo, snap_tolerance=0.1)
+    topo = test_snap_naar_buren(topo, snap_tolerance=0.01)
 
     log_timer(config, f"      - Topo | buffer & snap_naar_buren: {time.perf_counter() - t_stap:.2f}s")
     t_stap = time.perf_counter()
