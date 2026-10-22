@@ -245,7 +245,7 @@ class OsmContext:
                         except Exception:
                             pass
 
-            # Zet om naar gegeefde dataframes / lijsten in gewenste CRS
+            # Zet om naar dataframes / lijsten in gewenste CRS
             if polys_meta:
                 gdf_osm = gpd.GeoDataFrame({
                     'timestamp': [item['timestamp'] for item in polys_meta],
@@ -585,10 +585,29 @@ def ken_osm_tags_toe(gdf_simplified, osm_ctx):
             continue
 
         date_val = str(props.get('VERSDATUM') or props.get('begindatum') or '')[:10]
-        prefix = props.get('grb_layer', 'Gbg')
-        grb_laag = str(props.get('grb_layer', '')).upper()
+
+        # Dynamisch de juiste prefix bepalen op basis van de toegekende grb_layer
+        grb_laag_raw = str(props.get('grb_layer', 'Gbg')).strip()
+        if grb_laag_raw.lower() == 'gba':
+            prefix = 'Gba'
+        elif grb_laag_raw.lower() == 'knw':
+            prefix = 'Knw'
+        else:
+            prefix = 'Gbg'
+
+        grb_laag = grb_laag_raw.upper()
+
         oidn_val = props.get('OIDN') or props.get('id')
-        ref_val = f"{prefix}/{int(oidn_val)}" if oidn_val is not None and str(oidn_val).isdigit() else (f"Gbg/{oidn_val}" if oidn_val else None)
+        # Veilig omzetten naar een integer, zelfs als het binnenkomt als '1147879.0' of 1147879.0
+        clean_id = None
+        if oidn_val is not None:
+            try:
+                # Converteer via float om "1147879.0" op te vangen, daarna naar int
+                clean_id = int(float(str(oidn_val)))
+            except (ValueError, TypeError):
+                clean_id = oidn_val  # Fallback als het geen getal is
+
+        ref_val = f"{prefix}/{clean_id}" if clean_id is not None else None
 
         housenumber = props.get('addr:housenumber')
         heeft_adres = bool(housenumber and str(housenumber).strip() and str(housenumber).lower() != "nan")
