@@ -1,9 +1,11 @@
 # address_handler.py
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 from shapely.geometry import Polygon, MultiPolygon, box
 from shapely.ops import unary_union
 import re
+import gc
 
 def vul_gaten_van_polygoon(geom):
     if geom is None or geom.is_empty:
@@ -140,8 +142,7 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
     matched_poly_ids = set(intersect_join['orig_index']) if not intersect_join.empty else set()
 
     # -------------------------------------------------------------------------
-    # STAP 2: Gaten & Patio's dichten met vul_gaten_van_polygoon
-    # (Voor adrespunten in binnenpleinen)
+    # STAP 2: Gaten & Patio's dichten
     # -------------------------------------------------------------------------
     unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
     lege_gebouwen = proj_poly.loc[~proj_poly['orig_index'].isin(matched_poly_ids)].copy()
@@ -163,37 +164,30 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
             matched_poly_ids.update(hole_join['orig_index'])
 
     # -------------------------------------------------------------------------
-    # STAP 3: Omgekeerde nabijheid (4m buffer om losse adrespunten)
+    # STAP 3: Omgekeerde nabijheid (4m buffer)
     # -------------------------------------------------------------------------
     unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
 
     nearest_join = None
     if not unmatched_addr.empty and not proj_poly.empty:
-        # 1. Maak een tijdelijke 4m buffer om enkel de losse adrespunten
         buffered_addr = unmatched_addr.copy()
         buffered_addr['geometry'] = buffered_addr.geometry.buffer(4.0)
 
-        # 2. Snelle gevectoriseerde sjoin (GeoPandas gebruikt automatisch z'n interne C-index)
         matches = gpd.sjoin(buffered_addr, proj_poly, how='inner', predicate='intersects')
 
         if not matches.empty:
-            # 3. Bereken afstand veilig per match-rij (voorkomt lengte-mismatches en UserWarning)
             left_geoms = unmatched_addr.loc[matches.index, 'geometry'].to_numpy()
             right_geoms = proj_poly.loc[matches['orig_index'], 'geometry'].to_numpy()
 
             matches['dist_to_poly'] = gpd.GeoSeries(left_geoms).distance(gpd.GeoSeries(right_geoms)).to_numpy()
             matches['poly_area_val'] = proj_poly.loc[matches['orig_index'], 'poly_area'].values
 
-            # 4. Sorteer op kortste afstand, daarna op grootste gebouwoppervlakte
             matches = matches.sort_values(
                 by=['dist_to_poly', 'poly_area_val'],
                 ascending=[True, False]
             )
 
-            # 5. Bewaar per adrespunt-index maximaal 1 dichtstbijzijnde gebouw match
             nearest_join = matches[~matches.index.duplicated(keep='first')].copy()
-
-            # Herstel de originele puntgeometrie
             nearest_join['geometry'] = unmatched_addr.loc[nearest_join.index, 'geometry']
             nearest_join = nearest_join.drop(columns=['dist_to_poly', 'poly_area_val', 'index_right'], errors='ignore')
 
@@ -201,8 +195,7 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
             matched_poly_ids.update(nearest_join['orig_index'])
 
     # -------------------------------------------------------------------------
-    # STAP 4: Convex Hull via veilige_convex_hull_per_part
-    # (Laatste vangnet voor vreemd gevormde gebouwen)
+    # STAP 4: Convex Hull
     # -------------------------------------------------------------------------
     unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
     lege_gebouwen = proj_poly.loc[~proj_poly['orig_index'].isin(matched_poly_ids)].copy()
@@ -227,11 +220,11 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
     # -------------------------------------------------------------------------
     still_unmatched_addr = proj_addr.loc[~proj_addr.index.isin(matched_addr_ids)].copy()
     if import_loose_address_nodes and not still_unmatched_addr.empty:
-        for _, row_unmatched in still_unmatched_addr.iterrows():
+        for tuple_row in still_unmatched_addr.itertuples():
             extra_address_nodes.append({
-                'geometry': row_unmatched['geometry'],
-                'addr:street': row_unmatched.get('addr:street', ''),
-                'addr:housenumber': row_unmatched.get('addr:housenumber', ''),
+                'geometry': getattr(tuple_row, 'geometry'),
+                'addr:street': getattr(tuple_row, 'addr_street', getattr(tuple_row, 'addr:street', '')),
+                'addr:housenumber': getattr(tuple_row, 'addr_housenumber', getattr(tuple_row, 'addr:housenumber', '')),
                 'fixme': 'Niet gekoppeld aan gebouw: behouden als los adrespunt.',
             })
 
@@ -244,13 +237,12 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         gekoppeld['addr:housenumber'] = None
         return gekoppeld.drop(columns=['poly_area'], errors='ignore'), extra_address_nodes
 
-    # Adres-aggregatie per gebouw
     combined_join['addr:street'] = combined_join['addr:street'].astype(str).str.strip()
     combined_join['addr:housenumber'] = combined_join['addr:housenumber'].astype(str).str.strip()
 
     valid_mask = (
-        (combined_join['addr:street'] != '') & (combined_join['addr:street'].str.lower() != 'nan') &
-        (combined_join['addr:housenumber'] != '') & (combined_join['addr:housenumber'].str.lower() != 'nan')
+        (combined_join['addr:street'] != '') & (combined_join['addr:street'].str.lower() != 'nan') & (combined_join['addr:street'].str.lower() != 'none') &
+        (combined_join['addr:housenumber'] != '') & (combined_join['addr:housenumber'].str.lower() != 'nan') & (combined_join['addr:housenumber'].str.lower() != 'none')
     )
     filtered_join = combined_join[valid_mask]
 
@@ -260,24 +252,44 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         gekoppeld['addr:housenumber'] = None
         return gekoppeld.drop(columns=['poly_area'], errors='ignore'), extra_address_nodes
 
-    street_counts = filtered_join.groupby(['orig_index', 'addr:street']).size().reset_index(name='count')
-    primary_streets = street_counts.sort_values(['orig_index', 'count'], ascending=[True, False]).drop_duplicates('orig_index')
-
-    primary_join = filtered_join.merge(primary_streets[['orig_index', 'addr:street']], on=['orig_index', 'addr:street'])
-
-    df_addr_agg = (
-        primary_join.groupby(['orig_index', 'addr:street'])['addr:housenumber']
+    df_street_agg = (
+        filtered_join.groupby(['orig_index', 'addr:street'])['addr:housenumber']
         .unique()
         .reset_index()
     )
-    df_addr_agg['addr:housenumber'] = df_addr_agg['addr:housenumber'].apply(formatteer_huisnummers)
-    df_addr_agg = df_addr_agg.set_index('orig_index')
+    df_street_agg['formatted_hn'] = df_street_agg['addr:housenumber'].apply(formatteer_huisnummers)
+    df_street_agg['num_count'] = df_street_agg['addr:housenumber'].apply(len)
 
-    gekoppeld = proj_poly.join(df_addr_agg[['addr:street', 'addr:housenumber']], on='orig_index')
+    records = []
+    for orig_idx, group in df_street_agg.groupby('orig_index'):
+        group_sorted = group.sort_values(by='num_count', ascending=False).reset_index(drop=True)
+        res = {'orig_index': orig_idx}
 
-    # --- TIE-BREAKER VOOR DUBBELE REEKSEN ---
+        for i, row in group_sorted.iterrows():
+            idx = i + 1
+            street = str(row['addr:street']).strip()
+            hn = str(row['formatted_hn']).strip()
+
+            if idx == 1:
+                res['addr:street'] = street
+                res['addr:housenumber'] = hn
+            else:
+                res[f'addr:{idx}:street'] = street
+                res[f'addr:{idx}:housenumber'] = hn
+
+        records.append(res)
+
+
+    df_addr_wide = pd.DataFrame(records).set_index('orig_index')
+    gekoppeld = proj_poly.join(df_addr_wide, on='orig_index')
+
+    addr2_cols = [c for c in gekoppeld.columns if str(c).startswith('addr:2:')]
+    if addr2_cols:
+        aantal_extra = gekoppeld[addr2_cols].notna().any(axis=1).sum()
+        print(f"Aantal gebouwen met een addr:2 adres: {aantal_extra}")
+
     if gdf_wsm is not None and not gdf_wsm.empty:
-        wgm_union = gdf_wsm.geometry.union_all()
+        wgm_union = gdf_wsm.geometry.unary_union
         gekoppeld['dist_to_street'] = gekoppeld.geometry.distance(wgm_union)
     else:
         gekoppeld['dist_to_street'] = 0.0
@@ -287,26 +299,32 @@ def koppel_adressen(gdf_poly, sub_addr, gdf_wsm, existing_osm_addresses, import_
         ascending=[False, True]
     )
 
-    has_addr = gekoppeld['addr:housenumber'].notna() & gekoppeld['addr:street'].notna()
-
-    if has_addr.any():
-        met_adres = gekoppeld[has_addr].copy()
-        zonder_adres = gekoppeld[~has_addr].copy()
-
-        met_adres['single_nr'] = met_adres['addr:housenumber'].astype(str).str.split(';')
-        exploded = met_adres.explode('single_nr')
-
-        exploded_unique = exploded.drop_duplicates(subset=['addr:street', 'single_nr'], keep='first')
-
-        recombined = (
-            exploded_unique.groupby(exploded_unique.index)
-            .agg({'single_nr': lambda x: ';'.join(sorted(set(x), key=lambda n: (len(n), n)))})
+    if 'addr:housenumber' in gekoppeld.columns and 'addr:street' in gekoppeld.columns:
+        has_addr = (
+            gekoppeld['addr:housenumber'].notna() & (gekoppeld['addr:housenumber'].astype(str).str.lower() != 'nan') &
+            gekoppeld['addr:street'].notna() & (gekoppeld['addr:street'].astype(str).str.lower() != 'nan')
         )
 
-        met_adres['addr:housenumber'] = recombined['single_nr']
-        gekoppeld = pd.concat([met_adres, zonder_adres], ignore_index=False)
+        if has_addr.any():
+            met_adres = gekoppeld[has_addr].copy()
+            zonder_adres = gekoppeld[~has_addr].copy()
 
-    gekoppeld = gekoppeld.drop(columns=['poly_area', 'dist_to_street', 'single_nr'], errors='ignore')
+            met_adres['single_nr'] = met_adres['addr:housenumber'].astype(str).str.split(';')
+            exploded = met_adres.explode('single_nr')
+
+            exploded['orig_row_id'] = exploded.index
+            exploded_unique = exploded.drop_duplicates(subset=['orig_row_id', 'addr:street', 'single_nr'], keep='first')
+
+            recombined = (
+                exploded_unique.groupby('orig_row_id')
+                .agg({'single_nr': lambda x: ';'.join(sorted(set(x), key=sorteer_huisnummer))})
+            )
+
+            met_adres['addr:housenumber'] = recombined['single_nr']
+            gekoppeld = pd.concat([met_adres, zonder_adres], ignore_index=False)
+
+    gekoppeld = gekoppeld.drop(columns=['poly_area', 'dist_to_street', 'single_nr', 'orig_row_id'], errors='ignore')
     gekoppeld = gekoppeld.sort_index()
 
+    gc.collect()
     return gekoppeld, extra_address_nodes
